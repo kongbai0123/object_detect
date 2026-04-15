@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import argparse
@@ -12,9 +12,10 @@ from ultralytics import YOLO
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.append(str(SCRIPT_DIR))
-
+import sys
+from pathlib import Path
+# ⚠️ 解決 'def' 保留字問題
+sys.path.append(str(Path(__file__).resolve().parent / "def"))
 from pipeline_notice import print_pipeline_notice
 
 
@@ -25,27 +26,27 @@ def find_best_model() -> Path:
     """
     runs_dir = ROOT / "data/7_experiments"
     
-    # 策略 1: 冠軍模型 (經由 Promotion Gate 晉升)
-    global_best = runs_dir / "weight/global_best.pt"
+    # 策略 1: 冠軍模型 (經由 Promotion Gate 晉升) # global_best.pt
+    global_best = runs_dir / "exp_v072_base4/weights/best.pt"
     if global_best.exists():
         return global_best
         
-    # # 策略 2: 最新挑戰者模型
-    # latest_challenger = runs_dir / "weight/latest_best.pt"
-    # if latest_challenger.exists():
-    #     return latest_challenger
+    # 策略 2: 最新挑戰者模型
+    latest_challenger = runs_dir / "weights/latest_best.pt"
+    if latest_challenger.exists():
+        return latest_challenger
         
-    # # 策略 3: 遍歷所有 exp{num} 尋找最新修改時間的 best.pt
-    # import glob
-    # found = sorted(
-    #     glob.glob(str(runs_dir / "exp*/weights/best.pt"), recursive=True), 
-    #     key=os.path.getmtime
-    # )
-    # if found:
-    #     return Path(found[-1])
+    # 策略 3: 遍歷所有 exp{num} 尋找最新修改時間的 best.pt
+    import glob
+    found = sorted(
+        glob.glob(str(runs_dir / "exp*/weights/best.pt"), recursive=True), 
+        key=os.path.getmtime
+    )
+    if found:
+        return Path(found[-1])
         
-    # # 策略 4: Fallback
-    # return Path("yolov8n.pt")
+    # 策略 4: Fallback
+    return Path("yolov8n.pt")
 
 DEFAULT_MODEL = find_best_model()
 DEFAULT_OUTPUT_DIR = ROOT / "data/7_experiments/video_preds"

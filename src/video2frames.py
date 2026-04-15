@@ -3,7 +3,9 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
-
+import sys
+# ⚠️ 解決 'def' 保留字問題
+sys.path.append(str(Path(__file__).resolve().parent / "def"))
 from pipeline_notice import print_pipeline_notice
 
 ROOT = Path(__file__).resolve().parent.parent

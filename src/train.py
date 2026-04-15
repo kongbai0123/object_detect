@@ -1,10 +1,16 @@
+import sys
 import os
-import yaml
 import json
+import yaml
 import logging
 import argparse
+from pathlib import Path
 from datetime import datetime
 from ultralytics import YOLO
+
+# ⚠️ 解決 'def' 為 Python 保留字無法直接作為 package import 的問題
+# 我們將其加入 sys.path 以便直接 import 裡面的副程式
+sys.path.append(str(Path(__file__).resolve().parent / "def"))
 from pipeline_notice import print_pipeline_notice
 
 # =====================================================================
@@ -53,7 +59,7 @@ class ExperimentTracker:
         
         global_best_dir = os.path.join(os.path.dirname(os.path.dirname(self.history_file)), 'weight')
         os.makedirs(global_best_dir, exist_ok=True)
-        global_best_path = os.path.join(global_best_dir, 'global_best.pt')
+        global_best_path = os.path.join(global_best_dir, 'yolov8s.pt')
         
         is_promoted = False
         reason = ""
@@ -66,7 +72,8 @@ class ExperimentTracker:
         
         try:
             # 執行 eval_ghosts.py 針對這批新權重進行測試
-            eval_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eval_ghosts.py')
+            # 修正：指向新的 src/def/ 目錄
+            eval_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'def', 'eval_ghosts.py')
             cmd = [sys.executable, eval_script, "--model", str(new_weights_path), "--output", ghost_eval_dir]
             if os.path.exists(global_best_path):
                 cmd += ["--baseline", global_best_path]
@@ -189,19 +196,86 @@ class ExperimentTracker:
             if self.logger:
                 self.logger.error(f" 記錄實驗歷程失敗: {e}")
                 
+        # --- 自動同步至 Markdown 日誌 ---
+        self._update_markdown_report(record, note="Auto-logged from trainer")
+                
         return metrics_dict, len(history) - 1 # 回傳 index 以便稍後更新 promoted 狀態
         
     def update_promotion_status(self, record_index):
-        """將該次實驗標記為已晉升"""
+        """將該次實驗標記為已晉升並同步更新 Markdown"""
         try:
             with open(self.history_file, 'r+', encoding='utf-8') as f:
                 history = json.load(f)
                 history[record_index]["promoted_to_global"] = True
                 f.seek(0)
-                f.truncate()
                 json.dump(history, f, indent=4)
-        except:
-            pass
+                f.truncate()
+            
+            # 同步更新 Markdown 中的備註
+            self._update_markdown_report(history[record_index], note="🏆 **Promoted to Global Best!**")
+            
+            if self.logger: self.logger.info(f" [Tracker] 已將紀錄 #{record_index} 標記為晉升狀態。")
+        except Exception as e:
+            if self.logger: self.logger.error(f" 更新晉升狀態失敗: {e}")
+
+    def _update_markdown_report(self, record, note=""):
+        """自動更新 data/7_experiments/training_history.md (表格式)"""
+        md_file = os.path.join(os.path.dirname(self.history_file), "training_history.md")
+        # 確保目錄存在
+        os.makedirs(os.path.dirname(md_file), exist_ok=True)
+        
+        if not os.path.exists(md_file):
+            header = "# Training History Report\n\n"
+            header += "This table shows all experiment folders in `data/7_experiments` sorted from **Newest to Oldest**.\n\n"
+            header += "| Order | Experiment Name | Date & Time | Dataset | mAP50 | Notes |\n"
+            header += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+            with open(md_file, 'w', encoding='utf-8') as f:
+                f.write(header)
+        
+        try:
+            with open(md_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # 準備新資料行
+            ts = datetime.fromisoformat(record["timestamp"]).strftime("%Y-%m-%d %H:%M")
+            name = os.path.basename(record["save_dir"])
+            ds = record["dataset"]
+            map50 = record["metrics"]["mAP50"]
+            
+            new_line = f"| - | **{name}** | {ts} | {ds:<18} | {map50:.3f} | {note} |\n"
+            
+            # 檢查是否已經存在該實驗的紀錄（避免重複插入，例如晉升時的二次呼叫）
+            # 我們搜尋是否存在該實驗名稱
+            exists = False
+            for i, line in enumerate(lines):
+                if f"**{name}**" in line:
+                    # 如果找到了，更新那一行的 Note
+                    parts = line.split('|')
+                    if len(parts) >= 7:
+                        parts[6] = f" {note} \n"
+                        lines[i] = "|".join(parts)
+                    exists = True
+                    break
+            
+            if not exists:
+                # 尋找表格插入點 (Header 分割線下方)
+                insert_idx = -1
+                for i, line in enumerate(lines):
+                    if line.strip().startswith('| :---'):
+                        insert_idx = i + 1
+                        break
+                
+                if insert_idx != -1:
+                    lines.insert(insert_idx, new_line)
+                else:
+                    lines.append(new_line)
+            
+            with open(md_file, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+            
+            if self.logger: self.logger.info(f" 📖 訓練日誌已自動同步至: {md_file}")
+        except Exception as e:
+            if self.logger: self.logger.error(f" 自動更新 Markdown 日誌失敗: {e}")
 
 # =====================================================================
 # 2 Configuration Manager (解決超參數硬編碼與強變形風險)
@@ -240,7 +314,7 @@ class HyperparameterConfig:
             cfg = yaml.safe_load(f)
             if is_incremental:
                 cfg['lr0'] = min(cfg.get('lr0', 0.01), 0.001)
-                cfg['epochs'] = min(cfg.get('epochs', 100), 40)
+                cfg['epochs'] = min(cfg.get('epochs', 100), 50)
             self.logger.info(f" 已成功載入外部參數檔: {self.config_path} (經增量模式校準)")
             return cfg
 
@@ -356,27 +430,32 @@ if __name__ == '__main__':
     dataset_version_name = "base_dataset"
 
             
-    default_config = os.path.join(script_dir, '../configs/train_config.yaml')
+    default_config = os.path.join(script_dir, '../configs/001_train_config.yaml')
 
+    # =========================================================================
+    # 💡 [可自由修改] 訓練權重設定
+    # =========================================================================
+    # 預設使用官方 'yolov8s.pt' 來從頭訓練。
+    # 若您想基於之前訓練好的模型繼續微調（例如基於最新的 base4），可以將此處改為您的路徑：
+    # 範例修改: default_weight = os.path.join(script_dir, '../data/7_experiments/exp_v072_base4/weights/best.pt')
+    default_weight = 'yolov8s.pt'
+    # default_weight = '../data/7_experiments/exp_v072_base8/weights/best.pt'
     parser = argparse.ArgumentParser(description='MLOps Level 3 企業級訓練引擎')
     parser.add_argument('--action', type=str, choices=['train', 'tune', 'auto_tune_train'], default='train', 
                         help='執行動作：train(一般訓練), tune(純調參), auto_tune_train(先調參後自動使用最佳參數訓練)')
     parser.add_argument('--data', type=str, default=default_yaml, help='dataset.yaml 目標路徑')
-    parser.add_argument('--config', type=str, default=default_config, help='超參數 train_config.yaml 路徑')
-    parser.add_argument('--weights', type=str, default='', help='初始權重檔，若為空則根據模式自動尋找')
+    parser.add_argument('--config', type=str, default=default_config, help='超參數 001_train_config.yaml 路徑')
+    parser.add_argument('--weights', type=str, default=default_weight, help='初始權重檔路徑 (建議修改上方的 default_weight 變數)')
     parser.add_argument('--incremental', action='store_true', help='啟用增量微調模式 (自動調降 LR 與 Epochs)')
     
     args = parser.parse_args()
     
-    # [Weights Discovery] 0.7.1 智慧偵測
-    if not args.weights:
-        if args.incremental:
-            # 優先找 global_best，次之 latest_best
-            g_path = os.path.join(script_dir, '../data/7_experiments/weight/global_best.pt')
-            l_path = os.path.join(script_dir, '../data/7_experiments/weight/latest_best.pt')
-            args.weights = g_path if os.path.exists(g_path) else (l_path if os.path.exists(l_path) else 'yolov8s.pt')
-        else:
-            args.weights = 'yolov8s.pt'
+    # [Weights Discovery] 0.7.1 智慧偵測 (如果是有輸入 --incremental，才會去硬找特定的接續權重)
+    if args.weights == 'yolov8s.pt' and args.incremental:
+        # 優先找 global_best，次之 latest_best
+        g_path = os.path.join(script_dir, '../data/7_experiments/weight/yolov8s.pt')
+        l_path = os.path.join(script_dir, '../data/7_experiments/weight/latest_best.pt')
+        args.weights = g_path if os.path.exists(g_path) else (l_path if os.path.exists(l_path) else 'yolov8s.pt')
             
     # 啟動各式系統中樞
     logger = setup_logger(os.path.join(script_dir, '../data/logs'))

@@ -4,6 +4,9 @@ import os
 import argparse
 from datetime import datetime
 from pathlib import Path
+import sys
+# ⚠️ 解決 'def' 保留字問題
+sys.path.append(str(Path(__file__).resolve().parent / "def"))
 from pipeline_notice import print_pipeline_notice
 
 CLASS_NAMES = ["open", "close"]
@@ -117,20 +120,73 @@ def launch_fiftyone(dataset_dir, export_dir, reset_dataset=False):
                 print(" 找不到 dataset.yaml，啟動 [智慧相容掃描模式]，支援未整理的扁平資料夾（如 auto_ann）...")
                 images_dir = os.path.join(dataset_dir, 'images')
                 labels_dir = os.path.join(dataset_dir, 'labels')
-                if not os.path.exists(images_dir):
-                    images_dir = dataset_dir
-                dataset = fo.Dataset.from_images_dir(images_dir, name=name)
                 
-                # 手動解析 YOLO txt 並加入 Bbox (對齊降維打擊決策: 兩分類)
+                # 若 images/ 子目錄不存在，回退到根目錄
+                base_images_dir = images_dir if os.path.exists(images_dir) else dataset_dir
+                
+                # [Smart Discovery] 如果目錄裡沒圖片但有標籤，改從標籤出發搜尋影像
+                img_list = [f for f in os.listdir(base_images_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+                if not img_list:
+                    print(" [提示] 目錄內無影像，嘗試從標籤檔反向追蹤原始影像池...")
+                    txt_list = [f for f in os.listdir(dataset_dir) if f.endswith('.txt') and f != 'classes.txt']
+                    if not txt_list and os.path.exists(labels_dir):
+                        txt_list = [f for f in os.listdir(labels_dir) if f.endswith('.txt')]
+                    
+                    if txt_list:
+                        potential_pools = [
+                            os.path.join(dataset_dir, "../2_filtered"),
+                            os.path.join(dataset_dir, "../1_raw/door_opening_frames"),
+                        ]
+                        samples = []
+                        for txt_file in txt_list:
+                            base_name = os.path.splitext(txt_file)[0]
+                            found_img = None
+                            for pool in potential_pools:
+                                if os.path.exists(pool):
+                                    for ext in ['.jpg', '.jpeg', '.png', '.webp', '.JPG', '.PNG']:
+                                        cand = os.path.join(pool, base_name + ext)
+                                        if os.path.exists(cand):
+                                            found_img = cand
+                                            break
+                                if found_img: break
+                            if found_img:
+                                samples.append(fo.Sample(filepath=found_img))
+                        
+                        dataset = fo.Dataset(name)
+                        dataset.add_samples(samples)
+                    else:
+                        print(" [錯誤] 找不到任何影像或標籤檔，請確認路徑。")
+                        return None, "error"
+                else:
+                    dataset = fo.Dataset.from_images_dir(images_dir, name=name)
+                
+                # 手動解析 YOLO txt 並加入 Bbox
                 class_names = {idx: name for idx, name in enumerate(CLASS_NAMES)}
                 added_labels = 0
                 for sample in dataset:
                     base_name = os.path.splitext(os.path.basename(sample.filepath))[0]
                     txt_candidates = [
-                        os.path.splitext(sample.filepath)[0] + ".txt",
                         os.path.join(labels_dir, f"{base_name}.txt"),
+                        os.path.join(dataset_dir, f"{base_name}.txt"),
                     ]
                     txt_path = next((p for p in txt_candidates if os.path.exists(p)), None)
+                    
+                    # --- [Smart Image Discovery] 智慧影像偵測 ---
+                    # 如果 dataset_dir 裡面只有 .txt，自動去生肉池尋找對應的 .jpg
+                    if not os.path.exists(sample.filepath):
+                        potential_pools = [
+                            os.path.join(dataset_dir, "../2_filtered"),
+                            os.path.join(dataset_dir, "../1_raw/door_opening_frames"),
+                        ]
+                        for pool in potential_pools:
+                            if os.path.exists(pool):
+                                for ext in ['.jpg', '.jpeg', '.png', '.webp', '.JPG', '.PNG']:
+                                    cand = os.path.join(pool, base_name + ext)
+                                    if os.path.exists(cand):
+                                        sample.filepath = cand
+                                        break
+                            if os.path.exists(sample.filepath): break
+
                     if txt_path:
                         detections = []
                         with open(txt_path, "r", encoding="utf-8") as f:
@@ -221,11 +277,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='FiftyOne MLOps 深度分析中心')
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # 預設讀取永遠不被污染的 validation 基準集，才能進行真實的模型評估
-    default_dataset = os.path.normpath(os.path.join(script_dir, '../data/6_augmented/val'))
+    # 預設指向自動標註輸出的目錄，以便進行快節奏的成果分析與過濾
+    default_dataset = os.path.normpath(os.path.join(script_dir, '../data/5_auto_ann'))
     default_export = build_default_export_dir(default_dataset)
     
-    parser.add_argument('--dir', type=str, default=default_dataset, help='包含 images 或 dataset.yaml 的目錄 (預設抓嚴格隔離的 val_frozen)')
+    parser.add_argument('--dir', type=str, default=default_dataset, help='包含 images 或 YOLO txt 標籤的目錄 (預設指向 5_auto_ann)')
     parser.add_argument('--export-dir', type=str, default=default_export, help='關閉 FiftyOne 後，將編輯後標註匯出的資料夾')
     parser.add_argument('--reset-dataset', action='store_true', help='重建 FiftyOne dataset，而不是沿用既有修改')
     args = parser.parse_args()

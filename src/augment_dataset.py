@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 import argparse
 import random
+# ⚠️ 解決 'def' 保留字問題
+sys.path.append(str(Path(__file__).resolve().parent / "def"))
 from pipeline_notice import print_pipeline_notice
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -169,7 +171,7 @@ def run_augmentation(input_dir, output_dir, multiplier=3):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, default=str(ROOT / "data/6_augmented/train_src_balanced"))
+    parser.add_argument("--input", type=str, default=str(ROOT / "data/6_augmented/train_src"))
     parser.add_argument("--output", type=str, default=str(ROOT / "data/6_augmented/train"))
     parser.add_argument("--multiplier", type=int, default=3)
     args = parser.parse_args()

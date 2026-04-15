@@ -1,12 +1,15 @@
 import os
+from datetime import datetime
 import argparse
 # Ultralytics 內建支援 YOLO + SAM 自動標註功能
 from ultralytics.data.annotator import auto_annotate
 import glob as _glob
 import zipfile
 import yaml
+import sys
 from pathlib import Path
-from datetime import datetime
+# ⚠️ 解決 'def' 保留字問題
+sys.path.append(str(Path(__file__).resolve().parent / "def"))
 from pipeline_notice import print_pipeline_notice
 def run_auto_annotation(data_dir, det_model='yolov8x.pt', sam_model='mobile_sam.pt', conf=0.6, iou=0.5):
     """
@@ -26,17 +29,48 @@ def run_auto_annotation(data_dir, det_model='yolov8x.pt', sam_model='mobile_sam.
     
     import shutil
     auto_out_dir = data_dir + '_auto_annotate_labels'
-    # 修正：直接定位到專案根目錄下的 data/4_auto_ann
+    
+    # 定位到專案根目錄下的 data/5_auto_ann
     script_dir = os.path.dirname(os.path.abspath(__file__))
     final_out_dir = os.path.normpath(os.path.join(script_dir, '../data/5_auto_ann'))
     
+    # 準備子目錄結構 (標準 YOLO 格式)
+    img_out_dir = os.path.join(final_out_dir, 'images')
+    lbl_out_dir = os.path.join(final_out_dir, 'labels')
+    
+    for d in [img_out_dir, lbl_out_dir]:
+        if os.path.exists(d):
+            shutil.rmtree(d)
+        os.makedirs(d, exist_ok=True)
+    
+    # === 1. 移動 AI 生成的有效標籤 ===
+    detected_count = 0
     if os.path.exists(auto_out_dir):
-        if os.path.exists(final_out_dir):
-            shutil.rmtree(final_out_dir)
-        shutil.move(auto_out_dir, final_out_dir)
+        for txt_file in _glob.glob(os.path.join(auto_out_dir, '*.txt')):
+            shutil.move(txt_file, os.path.join(lbl_out_dir, os.path.basename(txt_file)))
+            detected_count += 1
+        shutil.rmtree(auto_out_dir)
+    
+    # === 2. 複製原始影像並補全空標籤 ===
+    image_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.JPG', '.PNG']
+    total_images = 0
+    for ext in image_extensions:
+        for img_path in _glob.glob(os.path.join(data_dir, f'*{ext}')):
+            base_name = os.path.splitext(os.path.basename(img_path))[0]
+            # 複製影像
+            shutil.copy2(img_path, os.path.join(img_out_dir, os.path.basename(img_path)))
+            
+            # 檢查標籤是否存在，不存在則補一個空的
+            lbl_path = os.path.join(lbl_out_dir, base_name + '.txt')
+            if not os.path.exists(lbl_path):
+                with open(lbl_path, 'w', encoding='utf-8') as f:
+                    pass # 建立空標籤檔
+            
+            total_images += 1
     
     print("\n 自動標註程序已完成！")
-    print(f" 標籤檔已經移動至指定的存放目錄: {final_out_dir}")
+    print(f" [統計資訊] 原始影像: {total_images} 張 | 偵測到目標: {detected_count} 張")
+    print(f" 完整資料集已準備就緒: {final_out_dir}")
     return final_out_dir
 
 def create_cvat_package(img_dir, lbl_dir, zip_name=None):
@@ -45,7 +79,10 @@ def create_cvat_package(img_dir, lbl_dir, zip_name=None):
     與 hard.zip 範例 1:1 對位 (僅上傳標籤用)
     """
     img_path = Path(img_dir)
+    # 支援新結構: 如果傳入的是 5_auto_ann，自動向下搜尋 labels 子目錄
     lbl_path = Path(lbl_dir)
+    if (lbl_path / "labels").exists():
+        lbl_path = lbl_path / "labels"
     
     # 專案根目錄 C:\antigravity\
     root_dir = Path(__file__).resolve().parent.parent
@@ -56,7 +93,7 @@ def create_cvat_package(img_dir, lbl_dir, zip_name=None):
     
     # === 1. 執行舊有壓縮檔的自動歸檔 ===
     import shutil
-    old_zips = root_dir.glob("cvat_auto_ann_*.zip")
+    old_zips = list(root_dir.glob("cvat_auto_ann_*.zip"))
     for oz in old_zips:
         dest = archive_subdir / oz.name
         try:
@@ -76,7 +113,12 @@ def create_cvat_package(img_dir, lbl_dir, zip_name=None):
     print(f"\n [打包程序] 正在建立 Darknet 標籤包: {zip_out}")
     
     # === 3. 讀取 dataset.yaml 獲取類別定義 ===
+    # 優先從標籤目錄的父層找 (即 5_auto_ann/)
     dataset_yaml = lbl_path.parent / "dataset.yaml"
+    if not dataset_yaml.exists():
+        # 次之從標籤目錄內找
+        dataset_yaml = lbl_path / "dataset.yaml"
+    
     class_names = ["open", "close"] # Fallback
     if dataset_yaml.exists():
         try:
@@ -91,6 +133,9 @@ def create_cvat_package(img_dir, lbl_dir, zip_name=None):
 
     # === 4. 蒐集目前生成的標籤檔 ===
     txt_files = list(lbl_path.glob("*.txt"))
+    # 過濾掉 classes.txt
+    txt_files = [f for f in txt_files if f.name != "classes.txt"]
+    
     if not txt_files:
         print(" 警告: 找不到任何標籤檔，取消打包。")
         return None
@@ -135,8 +180,11 @@ def create_cvat_package(img_dir, lbl_dir, zip_name=None):
                                 coords = [float(x) for x in parts[1:]]
                                 xs = coords[0::2]
                                 ys = coords[1::2]
-                                min_x, max_x = min(xs), max(xs)
-                                min_y, max_y = min(ys), max(ys)
+                                # [BBox Clamping] 強制將座標限制在圖像邊界內 (0.0~1.0)
+                                min_x = max(0.0, min(1.0, min(xs)))
+                                max_x = max(0.0, min(1.0, max(xs)))
+                                min_y = max(0.0, min(1.0, min(ys)))
+                                max_y = max(0.0, min(1.0, max(ys)))
                                 
                                 # 轉回標準中心點座標 (cx, cy, w, h)
                                 cx = (min_x + max_x) / 2.0
@@ -148,8 +196,22 @@ def create_cvat_package(img_dir, lbl_dir, zip_name=None):
                                 # 若解析失敗，原樣保留
                                 converted_lines.append(line.strip())
                         else:
-                            # 已經是標準 5 元素的 Bounding Box，直接放行
-                            converted_lines.append(line.strip())
+                            # 已經是標準 5 元素的 Bounding Box，同樣實施邊界剪裁
+                            try:
+                                c_id, cx, cy, w, h = map(float, parts)
+                                # 限制 cx, cy, w, h，確保任何一邊都不會超過 0 或 1
+                                cx = max(0.0, min(1.0, cx))
+                                cy = max(0.0, min(1.0, cy))
+                                w  = max(0.0, min(1.0, w))
+                                h  = max(0.0, min(1.0, h))
+                                # 修正超過邊界的 w/h (例如 cx=0.9, w=0.3 -> 會超過 1.0)
+                                if (cx + w/2) > 1.0: w = (1.0 - cx) * 2
+                                if (cx - w/2) < 0.0: w = cx * 2
+                                if (cy + h/2) > 1.0: h = (1.0 - cy) * 2
+                                if (cy - h/2) < 0.0: h = cy * 2
+                                converted_lines.append(f"{int(c_id)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+                            except ValueError:
+                                converted_lines.append(line.strip())
             except Exception as e:
                 print(f" 警告: 處理標籤 {txt.name} 失敗 ({e})")
                 continue

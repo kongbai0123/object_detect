@@ -2,6 +2,9 @@ import os
 import zipfile
 import shutil
 from pathlib import Path
+import sys
+# ⚠️ 解決 'def' 保留字問題
+sys.path.append(str(Path(__file__).resolve().parent / "def"))
 from pipeline_notice import print_pipeline_notice
 
 #還未產出labels之前，先自行開啟CVAT，匯入圖片，並手動標註   

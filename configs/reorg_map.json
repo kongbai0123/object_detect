@@ -1,0 +1,13 @@
+{
+    "train_config.yaml": "001_train_config.yaml",
+    "train_config_imgsz768.yaml": "002_train_config_imgsz768.yaml",
+    "train_config_stable_long_768.yaml": "003_train_config_stable_long_768.yaml",
+    "train_config_stable_long_832.yaml": "004_train_config_stable_long_832.yaml",
+    "train_config_incremental_832.yaml": "005_train_config_incremental_832.yaml",
+    "train_config_final_832_adamw.yaml": "006_train_config_final_832_adamw.yaml",
+    "train_config_inc_base5_1_832.yaml": "007_train_config_inc_base5_1_832.yaml",
+    "train_config_box_refine_1_832.yaml": "008_train_config_box_refine_1_832.yaml",
+    "train_config_residual_refine_1_832.yaml": "009_train_config_residual_refine_1_832.yaml",
+    "train_config_y8s_initial_20260410.yaml": "010_train_config_y8s_initial_20260410.yaml",
+    "train_config_y8s_close_repair_1.yaml": "011_train_config_y8s_close_repair_1.yaml"
+}

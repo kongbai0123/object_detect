@@ -23,6 +23,7 @@ storage/
 *.engine
 
 # --- [System & Logs] ---
+runs/
 external/
 .gemini/
 scratch/

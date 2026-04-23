@@ -1,58 +1,59 @@
-# 🚀 Project Evolution & Experiment History (工業門偵測版控日誌)
+# Industrial Door Detection & Decision System (Antigravity)
 
-本文件紀錄 MLOps 管線的演進歷史與歷次回合的實驗除錯紀錄，作為專案推進的核心軌跡。
+![Status](https://img.shields.io/badge/Status-Production--Ready-green)
+![Python](https://img.shields.io/badge/Python-3.8+-blue)
+![YOLOv8](https://img.shields.io/badge/Engine-YOLOv8-red)
+
+這是一個專為工業邊緣端 (Edge) 設計的高可靠度門狀態偵測系統。不同於一般的物件偵測，本專案整合了 **時序決策引擎 (Industrial Decision Engine)**，能有效解決光影干擾、閃爍、與邊界模糊判斷問題。
 
 ---
 
-## 📅 版本歷史日誌 (Version History)
+## 🚀 核心優勢 (Key Features)
 
-### [v0.7.2] 語義修正與資料重心轉置 (Semantic Correction & Replay Protection) - *當前版本*
-**核心目標**：修正 Open 類別語義漂移（路牌誤判）並解決新環境下的 Close 漏報問題。
-*   **🛠️ 決策與行動**：
-    1.  **CLIP 語義採礦**：跳過 YOLO 的視覺盲點，改用 CLIP 從新影片中精準提煉 116 張「人手開門」高品質樣本。
-    2.  **化誤報為負樣本**：將 0.7.1 YOLO 誤判的路牌樣本轉化為 Hard Negative（背景圖），強制模型學習「路牌不是門」。
-    3.  **定海神針 (Replay Core) 植入**：建立 200 張黃金樣本池，並修改 `split_dataset.py` 確保每次增量訓練都「強制注入」核心記憶，防止災難性遺忘。
-    4.  **數據重平衡 (1:2.7)**：對冗餘關門畫格進行 Scene-aware 下採樣，將 Open/Close 比例優化至健康區間。
-*   **📈 營運現況 (2026-04-09)**：
-    - **數據工程完工**：完成 Phase 1-3 採礦與重組，Open 類別實施 3 倍增強。
-    - **背景訓練啟動**：增量特訓 `exp_v072_inc` 執行中，重點觀察路牌拒判能力。
+### 1. 工業級決策引擎 (Industrial Decision Engine)
+*   **時序平滑 (Temporal Smoothing)**：採用 10 幀滑動窗口投票，消除單幀跳動。
+*   **雙軌權重判定**：Open (紅框) 具備高優先級，Close (綠框) 負責日常穩定監控。
+*   **物理幾何約束**：自動過濾面積過小或過大的非理性偵測框。
 
-### [v0.7.1] 營運管線化與增量閉環 (Incremental AL Loop)
-**核心目標**：從「單次訓練」轉化為「可持續迭代的生產管線」
-*   **🛠️ 決策與行動**：
-    1.  **類別感知增強 (Conditioned Aug)**：針對 Open (補強)、Close (保守)、BG (拒判) 實施 3 組不同 Profile。
-    2.  **增量微調模式 (--incremental)**：鎖定 `lr0=0.001` 與 30 輪短衝刺。
-    3.  **安全閘門制度 (Ghost Promotion Gate)**：整合 `eval_ghosts.py` 至晉升邏輯。
-    4.  **Replay Core 策略**：建立初步隔離機制，確保增量訓練包含歷史資料。
-*   **📈 歷史總結**：
-    - **首戰告捷**：成功執行首次 0.7.1 增量閉環，Recall 達到 0.953。
-    - **發現漏洞**：在對抗性測試中發現對「路牌」有語義偏移，觸發 v0.7.2 的修正計畫。
+### 2. 全量吸收訓練鏈路 (Full-Merge Absorption Pipeline)
+*   **場景感知切分 (Scene-Aware Split)**：防止視訊序列造成的資料洩漏 (Data Leakage)。
+*   **雙向 Open 保護**：動態確保驗證集具備監督能力的同時，守住訓練集的正樣本保底。
+*   **領域權重平衡 (Domain Balancing)**：防止單一數據版本 (如 `fif`) 造成模型偏移。
 
-### [v0.6.1] 獵鬼行動與類別再平衡 (修正場景洩漏並重啟)
+### 3. Edge 端事件優化
+*   **低延遲觸發**：專為邊緣設備優化的推論邏輯。
+*   **高可信度輸出**：支援 Open-Centric 模式，只在極其確定時觸發警報。
 
-**硬體目標**：NVIDIA Jetson Orin Nano (TensorRT) / Coral TPU (TFLite INT8)
-* **🩺 核心病灶**：發現 v0.5 最佳 F1 門檻極低 (0.085)，且 `close` 樣本量為 `open` 的 4.6 倍，導致嚴重「背景特徵吸收」。模型遇到未知背景便會安全地猜測為 `close`。
-* **🛠️ 決策與行動**：
-  1. **分層困難挖掘**：實作 `mine_hard_negatives.py`，撈出 200 張高自信度「假關門 (fp_close_high)」影像。
-  2. **類別補強平衡**：早期使用 `mine_open_samples.py`，目前已由 `mine_open_v2.py` 取代，從原始影片再抽新開門特徵以補強分布。
-  3. **資料庫去毒回流**：將「無車門的純鬼影像 (ghost_)」與「補強開門 (boost_open_)」無損匯入 `3_processed` 黃金池。
-  4. **模型訓練特調**：提升輸入解析度 `imgsz=768`，小幅調升損失權重 `cls=0.7`，並設置 `close_mosaic=10` 保留真實背景結構。
-* **📈 當前狀態**：YOLOv8s 第 15 次實驗 (exp15) 訓練中。
+---
 
-### [v0.5] 邊緣佈署準備與 YOLOv8s 升級
-* **🛠️ 決策與行動**：將主架構由 YOLOv8n 升級為解析力更強的 YOLOv8s。確立量化佈署計畫，規劃導出 TensorRT FP16 與 TFLite INT8，專攻邊緣推論。
+## 🛠️ 快速開始 (Quick Start)
 
-### [v0.4] 資料庫災難與淨化復原 (Data Contamination Recovery)
-* **🩺 核心病灶**：v0.3 發生致命「同名檔覆蓋」污染（自動標註蓋過了高品質手標黃金資料），導致開門召回率雪崩至 29%。
-* **🛠️ 決策與行動**：
-  1. 全面清空並重建 `3_processed`，從備份 zip 搶救出 126 張原始人工金標。
-  2. 導入 `miner_` 前綴隔離機制，化解後續檔案碰撞風險。重組出 271 張純淨樣本。
-  3. 重啟訓練 (exp13)，**開門 Recall 成功暴升至 83%**，模型智力回歸標準值。
+### 1. 環境安裝
+```powershell
+pip install -r requirements.txt
+```
 
-### [v0.3] CLIP 語義採礦 (Semantic Mining)
-* **🛠️ 決策與行動**：建置 `clip_filter.py` 以文生圖模型自動過濾含有門與無門的場景，意圖依靠資料加量解決誤判問題（但隨後引爆 v0.4 檔名衝突災害）。
+### 2. 影片推論測試 (Industrial Evaluation)
+執行具備決策引擎的影片推理，結果將存於 `storage/artifacts/evaluations/videos`。
+```powershell
+python src/video_pt_test.py --source storage/assets/videos --model path/to/best.pt
+```
 
-### [v0.1 ~ v0.2] MLOps 單階段管線重塑 (Base Pipeline Migration)
-* **🛠️ 決策與行動**：
-  1. 放棄專案初期的「YOLO 偵測 + CNN 分類」雙引擎過時架構，重新整併為端到端單階段 YOLOv8 推論。
-  2. 建立最高防護層級的 `{1_raw, 2_filtered, 3_processed}` 資料流金字塔與 `cvat_import.py` 整合工具庫。
+### 3. 啟動增量訓練 (Incremental Training)
+```powershell
+python src/train_loop.py --start all --mode incremental
+```
+
+---
+
+## 📂 專案結構 (Directory Structure)
+
+*   `src/`：核心演算法與執行腳本。
+    *   `anti_gravity/`：系統底座、設定管理與數據處理器。
+*   `configs/`：所有的訓練與鏈路 YAML 配置。
+*   `storage/`：(Git Ignored) 資料存儲區，包含 assets, workspace 與 artifacts。
+
+---
+
+## 📜 決策紀錄 (Architectural Decisions)
+詳細的開發歷程與技術決策請參閱 `implementation_plan.md`。

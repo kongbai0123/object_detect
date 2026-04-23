@@ -1,0 +1,6 @@
+epochs: 1
+imgsz: 128
+batch: 8
+patience: 1
+lr0: 0.001
+mosaic: 0.0

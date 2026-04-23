@@ -46,6 +46,44 @@ graph TD
 ### Temporal Voting (時間平滑)
 *   **防錯機制**：車門縫實在太難判斷（可能是電線桿反光、可能是車燈），如果單幀觸發就煞車，騎士會崩潰。你需要一個 `collections.deque(maxlen=5)`，當歷史 5 幀中有 3 幀都覺得在開門，才真正拉響警報。
 
+## 🔄 第三階段：MLOps 資料自動化流水線 (Data Pipeline)
+
+為了確保模型能持續迭代且不遺忘歷史知識，我們建立了一套標準化的資料流轉體系。
+
+```mermaid
+graph TD
+    %% 層級定義
+    subgraph S ["1. Sources (來源層)"]
+        RAW[storage/sources/raw<br/>原始影片/圖檔]
+    end
+
+    subgraph W ["2. Workspace (工作層)"]
+        AL[Auto Annotation<br/>自動標註/初步篩選]
+        SB[Split & Balance<br/>場景切分與降採樣]
+        AUG[Augmentation<br/>物理增強/天氣模擬]
+    end
+
+    subgraph A ["3. Assets (資產層)"]
+        GOLD[storage/assets/goldenset<br/>標註完成之黃金集]
+    end
+
+    subgraph AR ["4. Artifacts (產出層)"]
+        EXP[Experiments / Models<br/>訓練結果與最佳權重]
+    end
+
+    %% 資料流向
+    RAW --> AL
+    AL -->|匯入 CVAT| CVAT((人工複核))
+    CVAT -->|晉升| GOLD
+    GOLD --> SB
+    SB --> AUG
+    AUG -->|最終訓練集| EXP
+    
+    %% 點綴
+    style GOLD fill:#f96,stroke:#333,stroke-width:2px
+    style EXP fill:#bbf,stroke:#333,stroke-width:2px
+```
+
 ---
 
 ## 📏 專案下一代的資料與硬體指引

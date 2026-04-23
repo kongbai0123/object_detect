@@ -1,192 +1,187 @@
-import os
+import argparse
 import shutil
 import random
-import argparse
-import re
 from pathlib import Path
-from collections import defaultdict
-import sys
-# ⚠️ 解決 'def' 保留字問題
-sys.path.append(str(Path(__file__).resolve().parent / "def"))
-from pipeline_notice import print_pipeline_notice
+from typing import Optional, List, Tuple, Dict
+from anti_gravity.settings import settings
+from anti_gravity.logger import logger
+from anti_gravity.storage import DatasetStorage
+from anti_gravity.splitter import Splitter
+from anti_gravity.entities import ImageMetadata
 
-ROOT = Path(__file__).resolve().parent.parent
-
-def extract_scene_key(filename):
+class SplitService:
     """
-    從檔名萃取 scene key，避免同一影片的相鄰幀被切分到不同 set。
-    例如：
-    - BDD100k 格式: '00054602-3bf57337.jpg' -> '00054602'
-    - 連續幀格式: 'video1_frame001.jpg' -> 'video1_frame'
-    - 其他: fallback 到完整檔名 (獨立場景)
+    [Industrial Grade] 協調 Split 任務的服務層。
+    具備：
+    1. Per-version Dynamic Seeding (防止 Shuffle 偏誤)
+    2. Bidirectional Open Safeguard (下限 15% 監督能力，上限 30% 防止過度修正，保護 Train 60% 覆蓋率)
+    3. Dynamic Domain Cap (防止單一版本過載)
     """
-    name = Path(filename).stem
-    
-    # 規則 1: 破折號分隔 (如 BDD)
-    m1 = re.match(r"(.*?)-[a-zA-Z0-9]+$", name)
-    if m1: return m1.group(1)
-        
-    # 規則 2: 底線加數字結尾 (如連續截圖)
-    m2 = re.match(r"(.*?)_\d+$", name)
-    if m2: return m2.group(1)
-        
-    return name # 獨立場景
+    def __init__(self, storage: Optional[DatasetStorage] = None):
+        self.storage = storage or DatasetStorage()
+        self.base_seed = settings.train.patience
 
-def count_labels(lbl_dir, img_list):
-    open_cnt, close_cnt = 0, 0
-    for img in img_list:
-        lbl_file = lbl_dir / f"{img.stem}.txt"
-        if lbl_file.exists():
-            with open(lbl_file, 'r') as f:
-                content = f.read().split()
-                if not content: continue
-                # 如果有多個 bounding box
-                lines = f.read().split('\n')
-                lines = [c for c in content if len(c) > 0]
-                # 重新準確計算
-            with open(lbl_file, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if parts:
-                        if parts[0] == '0': open_cnt += 1
-                        elif parts[0] == '1': close_cnt += 1
-    return open_cnt, close_cnt
+    def get_stats(self, metadata_list) -> Tuple[int, int, int, int]:
+        """[Audit] 統計 Open, Close, Background 數量與含有 Open 的圖片數"""
+        o_box, c_box, bg_img = 0, 0, 0
+        o_img = 0
+        for m in metadata_list:
+            if m.is_background:
+                bg_img += 1
+            else:
+                o_box += m.open_cnt
+                c_box += m.close_cnt
+                if m.open_cnt > 0:
+                    o_img += 1
+        return o_box, c_box, bg_img, o_img
 
-def main():
-    parser = argparse.ArgumentParser(description="Scene-Aware Split dataset into Train and Val")
-    parser.add_argument("--input", type=str, default=str(ROOT / "data/3_processed"))
-    parser.add_argument("--out_train", type=str, default=str(ROOT / "data/6_augmented/train_src"))
-    parser.add_argument("--out_val", type=str, default=str(ROOT / "data/6_augmented/val"))
-    parser.add_argument("--split", type=float, default=0.8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--empty-labels", action="store_true", default=True, help="是否為無標籤背景產生空的 txt")
-    parser.add_argument("--freeze_val", type=str, default=str(ROOT / "data/val_frozen_v1"),
-                        help="若此路徑存在，則跳過 val 切分，直接同步使用凍結 val 集")
-    args = parser.parse_args()
+    def apply_open_safeguard(self, train_set: List[ImageMetadata], val_set: List[ImageMetadata]) -> Tuple[List[ImageMetadata], List[ImageMetadata], str]:
+        """
+        [Safeguard] 雙向場景級 Open 樣本保護。
+        平衡 [驗證集監督能力] 與 [訓練集吸收能力]。
+        """
+        total_open_imgs = len([m for m in (train_set + val_set) if m.open_cnt > 0])
+        # 若總數太少(例如 < 3)，直接跳過，不具備切分保護意義
+        if total_open_imgs < 3:
+            return train_set, val_set, ""
 
-    random.seed(args.seed)
-    
-    input_path = Path(args.input)
-    if (input_path / "images").exists():
-        img_dir = input_path / "images"
-    elif (input_path / "image").exists():
-        img_dir = input_path / "image"
-    else:
-        img_dir = input_path
-    lbl_dir = input_path / "labels" if (input_path / "labels").exists() else input_path
-    
-    images = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
-    if not images:
-        print(f"錯誤：沒有在 {img_dir} 找到圖片")
-        return
+        # 定義門檻 (基於專家建議)
+        min_val_target = max(3, round(total_open_imgs * 0.15))
+        max_val_cap = max(3, round(total_open_imgs * 0.30))
+        min_train_floor = max(3, round(total_open_imgs * 0.60))
         
-    # 1. 根據 Scene Key 分群
-    groups = defaultdict(list)
-    for img in images:
-        key = extract_scene_key(img.name)
-        groups[key].append(img)
-        
-    group_keys = list(groups.keys())
-    
-    # 若所有圖片被歸入同一 scene key，則退回以檔名為 key（獨立場景模式）
-    if len(group_keys) <= 1 and len(images) > 1:
-        groups = defaultdict(list)
-        for img in images:
-            groups[img.stem].append(img)
-        group_keys = list(groups.keys())
-    
-    random.shuffle(group_keys)
-    
-    # 2. Scene-Aware 切分
-    split_idx = max(1, int(len(group_keys) * args.split))
-    train_keys = group_keys[:split_idx]
-    val_keys = group_keys[split_idx:]
-    
-    train_imgs = []
-    for k in train_keys: train_imgs.extend(groups[k])
-        
-    val_imgs = []
-    for k in val_keys: val_imgs.extend(groups[k])
-
-    # --- Frozen Val 支援 ---
-    frozen_val_path = Path(args.freeze_val)
-    use_frozen_val = frozen_val_path.exists() and any(frozen_val_path.rglob("*.jpg"))
-    if use_frozen_val:
-        print(f"[Frozen Val] 偵測到 {frozen_val_path}，略過 val 切分，使用凍結 val 集。")
-        # 將原本切出的 val 歸還給 train
-        train_imgs.extend(val_imgs)
-        val_imgs = []
-        # 同步凍結 val 至 out_val
-        import shutil as _shutil
-        out_val_path = Path(args.out_val)
-        for subdir in ["images", "labels"]:
-            (out_val_path / subdir).mkdir(parents=True, exist_ok=True)
-            for f in (frozen_val_path / subdir).glob("*"):
-                _shutil.copy2(f, out_val_path / subdir / f.name)
-        print(f"[Frozen Val] 已同步凍結 val 至 {args.out_val} ({len(list((frozen_val_path/'images').glob('*')))} 張)")
-        
-    # 建立輸出庫
-    for d in [args.out_train, args.out_val]:
-        for subdir in ["images", "labels"]:
-            (Path(d) / subdir).mkdir(parents=True, exist_ok=True)
+        notes = []
+        while True:
+            cur_val_open = len([m for m in val_set if m.open_cnt > 0])
+            cur_train_open = len([m for m in train_set if m.open_cnt > 0])
             
-    def copy_split(img_list, keys_list, out_dir, name):
-        out_path = Path(out_dir)
-        for img in img_list:
-            lbl_name = img.stem + ".txt"
-            lbl_file = lbl_dir / lbl_name
+            # 停止條件 1: Val 已達標 (15%) 或已達上限 (30%)
+            if cur_val_open >= min_val_target or cur_val_open >= max_val_cap:
+                break
             
-            shutil.copy2(img, out_path / "images" / img.name)
-            
-            if lbl_file.exists():
-                shutil.copy2(lbl_file, out_path / "labels" / lbl_name)
-            elif args.empty_labels:
-                # 衛生修補: 生成空白標籤供 Ultralytics 正確視為背景
-                with open(out_path / "labels" / lbl_name, 'w') as f:
-                    pass
-                    
-        o_cnt, c_cnt = count_labels(lbl_dir, img_list)
-        bg_cnt = len([img for img in img_list if not (lbl_dir / f"{img.stem}.txt").exists() or os.path.getsize(lbl_dir / f"{img.stem}.txt") == 0])
-        
-        print(f"[{name}]")
-        print(f"  - Scenes (Groups): {len(keys_list)}")
-        print(f"  - Images: {len(img_list)}")
-        print(f"  - Open box: {o_cnt}, Close box: {c_cnt}, Pure BG images: {bg_cnt}")
-        print("-" * 30)
+            # 尋找 Train 中最小的 Open 場景
+            train_scenes = {}
+            for m in train_set:
+                if m.scene not in train_scenes: train_scenes[m.scene] = []
+                train_scenes[m.scene].append(m)
 
-    print(f"\n 開始進行 [Scene-Aware Split]...")
-    copy_split(train_imgs, train_keys, args.out_train, "Train 訓練集")
-    copy_split(val_imgs, val_keys, args.out_val, "Val 基準驗證集 (val_frozen)")
-    
-    # 強制注入 Replay Core 到 Train
-    replay_dir = ROOT / "data/9_replay_core"
-    if replay_dir.exists():
-        print("\n [Replay Core] 啟動注入保護...")
-        replay_imgs = list(replay_dir.rglob("*.jpg")) + list(replay_dir.rglob("*.png"))
-        if replay_imgs:
-            out_train_img = Path(args.out_train) / "images"
-            out_train_lbl = Path(args.out_train) / "labels"
-            r_cnt = 0
-            for r_img in replay_imgs:
-                r_lbl = r_img.parent / f"{r_img.stem}.txt"
-                shutil.copy2(r_img, out_train_img / r_img.name)
-                if r_lbl.exists():
-                    shutil.copy2(r_lbl, out_train_lbl / r_lbl.name)
-                elif args.empty_labels:
-                    with open(out_train_lbl / f"{r_img.stem}.txt", 'w') as f:
-                        pass
-                r_cnt += 1
-            print(f"✅ 成功將 {r_cnt} 張 Replay Core 定海神針強制植入訓練集！")
+            candidates = []
+            for s_name, s_imgs in train_scenes.items():
+                s_open_cnt = len([m for m in s_imgs if m.open_cnt > 0])
+                if s_open_cnt > 0:
+                    candidates.append((s_name, s_imgs, s_open_cnt))
             
-    print("\n切分完成！\n")
+            if not candidates: break
+            candidates.sort(key=lambda x: len(x[1])) # 最小影響優先
+
+            # 選中目標
+            best_s_name, best_s_imgs, best_s_open = candidates[0]
+            
+            # 停止條件 2: 檢查搬遷後是否會破壞 Train 的 60% 保底
+            if (cur_train_open - best_s_open) < min_train_floor:
+                # print(f"  [Safeguard Stop] Cannot move {best_s_name}, would drop train open below {min_train_floor}")
+                break
+            
+            # 執行遷移
+            train_set = [m for m in train_set if m.scene != best_s_name]
+            val_set.extend(best_s_imgs)
+            notes.append(f"Moved {best_s_name}(+{best_s_open}O)")
+
+        if not notes: return train_set, val_set, ""
+        return train_set, val_set, f"SG: {', '.join(notes)}"
+
+    def execute(self, input_arg: str, train_ratio: float = 0.8, balance_domain: bool = True):
+        logger.info(f"[SplitService] Starting split task, mode: {input_arg}, balance_domain: {balance_domain}")
+        
+        train_out = settings.paths.split / "current/train_src"
+        val_out = settings.paths.split / "current/val_candidate"
+        
+        all_train_set = []
+        all_val_set = []
+
+        target_dirs = []
+        if input_arg.lower() == "all":
+            versions_root = settings.paths.assets / "goldenset/versions"
+            target_dirs = sorted([d for d in versions_root.iterdir() if d.is_dir()])
+            print(f"\n[Full-Merge Mode] Industrial Split-then-Merge (Total {len(target_dirs)} versions)...")
+        else:
+            target_dirs = [Path(input_arg)]
+
+        # 預計算動態 Domain Cap (40%)
+        total_raw = 0
+        for d in target_dirs:
+            total_raw += len(list(d.glob("images/*.jpg"))) + len(list(d.glob("images/*.png")))
+        max_allowed = int(total_raw * train_ratio * 0.40)
+        print(f"[*] Global Capacity: {total_raw} imgs | Domain Cap: {max_allowed} per version\n")
+
+        # 1. 逐版本執行 [Split-then-Merge]
+        print("-" * 125)
+        print(f"{'Version':<12} | {'Train (Total/Scene/O-Img/C-Box)':<32} | {'Val (Total/Scene/O-Img/C-Box)':<32} | {'Note'}")
+        print("-" * 125)
+
+        for i, v_dir in enumerate(target_dirs):
+            metadata_list = self.storage.scan_directories([v_dir])
+            if not metadata_list: continue
+            
+            # --- [動態 Seed] ---
+            v_splitter = Splitter(seed=self.base_seed + i)
+            v_splitter.split_ratio = train_ratio
+            train_set, val_set = v_splitter.perform_split(metadata_list)
+            
+            # --- [修正: 雙向 Open Safeguard] ---
+            train_set, val_set, sg_note = self.apply_open_safeguard(train_set, val_set)
+
+            # --- [動態 Domain Balancing] ---
+            db_note = ""
+            if balance_domain and len(train_set) > max_allowed:
+                original_len = len(train_set)
+                random.seed(self.base_seed + 99)
+                train_set = random.sample(train_set, max_allowed)
+                db_note = f"Capped {original_len}->{max_allowed}"
+
+            all_train_set.extend(train_set)
+            all_val_set.extend(val_set)
+
+            # --- [Audit] ---
+            to_box, tc_box, tb_img, to_img = self.get_stats(train_set)
+            vo_box, vc_box, vb_img, vo_img = self.get_stats(val_set)
+            t_scenes = len(set(m.scene for m in train_set))
+            v_scenes = len(set(m.scene for m in val_set))
+            
+            print(f"{v_dir.name:<12} | {len(train_set):>4} ({t_scenes:>2}/{to_img:>3}/{tc_box:>3}) {'':<4} | "
+                  f"{len(val_set):>4} ({v_scenes:>2}/{vo_img:>2}/{vc_box:>2}) {'':<4} | {sg_note} {db_note}")
+
+        if not all_train_set: return
+
+        # 全域統計
+        go_box, gc_box, gb_img, go_img = self.get_stats(all_train_set)
+        vo_box, vc_box, vb_img, vo_img = self.get_stats(all_val_set)
+        print("-" * 125)
+        print(f"{'GLOBAL TOTAL':<12} | {len(all_train_set):>4} (O-Img:{go_img}/C-Box:{gc_box}/BG:{gb_img}) | "
+              f"{len(all_val_set):>4} (O-Img:{vo_img}/C-Box:{vc_box}/BG:{vb_img})")
+        print("-" * 125)
+
+        # 2. 實體部署
+        for d in [train_out, val_out]:
+            if d.exists(): shutil.rmtree(d)
+            d.mkdir(parents=True, exist_ok=True)
+
+        self.storage.deploy_dataset(all_train_set, train_out)
+        self.storage.deploy_dataset(all_val_set, val_out)
+        self._inject_replay_core(train_out)
+
+    def _inject_replay_core(self, train_dir: Path):
+        replay_dir = settings.paths.replay_core
+        if not replay_dir.exists(): return
+        metadata_list = self.storage.scan_directories([replay_dir])
+        if metadata_list:
+            self.storage.deploy_dataset(metadata_list, train_dir)
 
 if __name__ == "__main__":
-    main()
-    print_pipeline_notice(
-        output_paths=[str(ROOT / "data/6_augmented/train_src"), str(ROOT / "data/6_augmented/val")],
-        next_script="src/balance_dataset.py",
-        notes=[
-            "已啟用 Scene-Aware Split 預防場景洩露。",
-            "若進行 0.6.1 訓練，請先執行 balance_dataset.py 進行 close 降採樣。",
-        ],
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--ratio", type=float, default=0.8)
+    parser.add_argument("--balance_domain", action="store_true", default=True)
+    args = parser.parse_args()
+    service = SplitService()
+    service.execute(args.input, args.ratio, args.balance_domain)

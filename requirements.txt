@@ -1,32 +1,14 @@
-# ---> Core Foundation (Verified for antigravity pipeline) <---
+# --- Industrial Door Detection Pipeline Core Dependencies ---
 ultralytics>=8.0.0
-torch>=1.8.0
-torchvision>=0.9.0
-numpy>=1.24.0
-
-# ---> Computer Vision & Processing <---
-opencv-python>=4.6.0.66
-Pillow>=9.0.0
-
-# ---> YAML Configuration & Metadata <---
+opencv-python>=4.6.0
 PyYAML>=6.0
-
-# ---> Terminal UX & Multiprocessing <---
-tqdm>=4.65.0
-
-# ---> Active Learning & Analysis <---
-imagehash>=4.3.1
-fiftyone>=0.23.0
-
-# ---> Web Scraping Edge Cases <---
-requests>=2.28.0
-beautifulsoup4>=4.12.0
-
-# ---> Embedded & Edge Exporting (Deployment) <---
-onnx>=1.13.0
-onnxruntime>=1.14.0
-onnxsim>=0.4.17
-# tensorflow>=2.13.0
-
-# ---> Advanced Ray Tune (Hyperparameter GA) <---
-ray[tune]>=2.0.0
+pandas>=1.5.0
+matplotlib>=3.6.0
+tqdm>=4.64.0
+torch>=1.13.0
+torchvision>=0.14.0
+numpy>=1.23.0
+scipy>=1.9.0
+pillow>=9.2.0
+python-dateutil>=2.8.2
+psutil>=5.9.0

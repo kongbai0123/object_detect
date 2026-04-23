@@ -1,67 +1,45 @@
-# 🚪 工業門預警 MLOps 流水線 (Latest v2.0)
+# 🛠️ Antigravity 核心腳本說明 (Technical Reference)
 
-這套系統專為工業場景設計，旨在透過自動化流程訓練出高精準度的開門偵測模型。
-
----
-
-## 🚀 核心工作流 (Workflow)
-
-### 【第一階段】資料採集與標註 (Data Acquisition & Labeling)
-1.  **影片抽幀**：執行 `python src/video2frames.py` 將原始影片轉為圖片，存入 `data/1_raw/`。
-2.  **負樣本挖掘**：執行 `python src/select_negatives.py` 從影片中自動挑選「容易誤判的背景圖」放入 `data/3_processed/`。
-3.  **自動標註 (AI 初稿)**：
-    *   將生肉圖放入 `data/2_filtered/open`。
-    *   執行 `python src/auto_label.py`。
-    *   **下一步**：將生成的 ZIP 匯入 CVAT 進行人工複核，完成後存入 `data/3_processed/`。
-
-### 【第二階段】訓練預處理 (Training Pipeline)
-當 `data/3_processed/` 累積足夠樣本後，依序執行：
-1.  **資料切分 (Split)**：`python src/split_dataset.py`
-    *   將熟肉切分為 Train (80%) 與 Val (20%)。
-2.  **類別平衡 (Balance)**：`python src/balance_dataset.py`
-    *   對訓練集中的「純關門背景」進行降採樣，提升 `open` 類別權重。
-3.  **物理增強 (Augment)**：`python src/augment_dataset.py`
-    *   對平衡後的資料進行光照、天氣、旋轉等 4 倍擴增。
-
-### 【第三階段】啟動訓練與評估 (Training & Eval)
-1.  **開始訓練**：`python src/train.py --action train`
-    *   **新功能**：訓練結束後會自動更新 `data/7_experiments/training_history.md`。
-    *   **晉升機制**：若表現優異，模型會自動晉升為 `global_best.pt`。
-
-### 【第四階段】實地推論 (Live Inference)
-1.  **即時偵測**：`python object_detect/detect.py --source 0`
-    *   使用簡約版推論引擎，直接查看模型 raw 輸出。
+本目錄包含工業門偵測流水線的所有核心執行腳本。
 
 ---
 
-## 📁 目錄結構說明 (Directory Structure)
+## 🚀 核心執行鏈路 (Workflow)
 
-```text
-data/
-├── 1_raw/           # 原始影片與抽幀圖片
-├── 2_filtered/      # 待自動標註的生肉區
-├── 3_processed/     # [關鍵] 已標註完成的「熟肉」黃金池
-├── 5_auto_ann/      # Auto Label 產出的 AI 標註初稿
-├── 6_augmented/     # 流水線中轉區 (含 Train/Val 最終增強資料)
-├── 7_experiments/   # 訓練實驗結果與日誌
-└── dataset.yaml     # 訓練設定檔 (nc: 2)
-```
+### 1. 訓練流程編排 (`train_loop.py`)
+這是系統的 **「自動化大腦」**，負責串接資料準備與模型訓練。
+*   **功能**：自動執行 `Clean -> Split -> Balance -> Augment -> Train` 的全過程。
+*   **指令**：`python src/train_loop.py --start all --mode incremental`
 
-## 🛠️ 腳本說明 (Script Reference)
+### 2. 資料鏈路 (Data Pipeline)
+*   **`split_dataset.py`**：實施 **Industrial-Grade Split-then-Merge**。支援跨版本的場景感知切分，具備雙向 Open 樣本保護機制。
+*   **`balance_dataset.py`**：對訓練集進行類別平衡，防止 `close` (cls:1) 過度佔據 Batch 權重。
+*   **`augment_dataset.py`**：執行離線物理增強，針對 `open` 類別進行加權採樣。
 
-| 腳本名稱 | 功能描述 | 輸出位置 |
+### 3. 推理與決策 (`video_pt_test.py`)
+本專案的 **「決策中心」**，將 YOLO 偵測轉化為穩定的工業狀態。
+*   **工業決策引擎 (Industrial Decision Engine)**：
+    *   **時序平滑**：10 幀投票機制，消除狀態閃爍。
+    *   **專屬閾值**：Open (0.35) / Close (0.60) 差別化判定。
+    *   **幾何過濾**：排除非理性大小的偵測框。
+
+---
+
+## 📁 腳本一覽表 (Script Reference)
+
+| 腳本名稱 | 角色 | 核心功能 |
 | :--- | :--- | :--- |
-| `video2frames.py` | 影片轉圖片 | `data/1_raw/` |
-| `select_negatives.py`| 挖掘背景負樣本 | `data/3_processed/` |
-| `auto_label.py` | YOLO+SAM 自動標註 | `data/5_auto_ann/` |
-| `split_dataset.py` | 80/20 場景感知切分 | `data/6_augmented/train_src` |
-| `balance_dataset.py` | 關門類別降採樣 | `data/6_augmented/train_src_balanced` |
-| `augment_dataset.py` | 離線增強 | `data/6_augmented/train` |
-| `train.py` | 核心訓練引擎 | `data/7_experiments/` |
+| `train_loop.py` | 編排器 | 自動化迭代訓練流水線 |
+| `train.py` | 執行器 | 封裝 YOLO 訓練與成績回報邏輯 |
+| `video_pt_test.py`| 決策器 | 具備時序平滑的工業級推理腳本 |
+| `split_dataset.py` | 分配器 | 支援雙向 Safeguard 的場景切分 |
+| `balance_dataset.py`| 平衡器 | 調整訓練集 O:C 比例 |
+| `augment_dataset.py`| 增強器 | 離線 4 倍物理增強 |
+| `mine_dataset.py` | 挖掘器 | 自動偵測未標註影片中的目標並抽幀 |
 
 ---
 
-## ⚠️ 標註規範與原則
-*   **類別鎖死**：`0: open` (開啟/微開), `1: close` (完全關閉)。
-*   **拒絕毒化**：Auto Label 的結果**絕對不能**直接拿去跑 `balance_dataset`，必須先經過 CVAT 人工修正。
-*   **解析度規範**：訓練與推論請鎖定 `imgsz: 832` 以確保遠方門縫的識別能力。
+## ⚠️ 開發規範
+1.  **路徑引用**：請統一透過 `anti_gravity.settings` 獲取路徑，禁止在腳本中寫死 `storage/` 以外的路徑。
+2.  **色彩空間**：`cv2` 使用 **BGR**。繪圖時請注意：Red 為 `(0, 0, 255)`，Green 為 `(0, 255, 0)`。
+3.  **編碼建議**：在 Windows 環境下，請確保 `print` 語句不包含非 ASCII 字元，以避免編碼報錯。

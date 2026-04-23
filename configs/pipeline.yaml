@@ -1,0 +1,37 @@
+# Industrial Door Detection - Data Pipeline Configuration
+# 此檔案專注於「資料處理」與「標註治理」階段
+
+# =====================================================================
+# 1. 自動標註設定 (Auto-Labeling)
+# =====================================================================
+autolabel:
+  # 預設使用最新晉升模型，若要強制指定請在此填寫路徑
+  det_model: "C:/antigravity/storage/artifacts/experiments/rebuild/exp_rebuild_auto_iter_5_new_videos_0423_0801"           # 智慧路徑：自動補全 /weights/best.pt
+  sam_model: "sam2_t.pt"
+  conf: 0.6                         # 標註信心度，建議設高 (0.6) 以減少誤報
+  iou: 0.45
+  imgsz: 768                        # 推理尺寸與訓練對齊
+  min_box_area_px: 200              # 噪點硬過濾 (像素面積)
+  min_box_dim_px: 10                # 最小邊長過濾 (像素)
+  target_classes: [0, 1]            # 0: open, 1: close
+
+# =====================================================================
+# 2. 樣本平衡設定 (Dataset Balancing)
+# =====================================================================
+balance:
+  target_ratio: 2.0                 # 目標 Close:Open 比例
+  max_bg_ratio: 0.2                 # 背景樣本上限比例
+  min_valid_area: 0.00005           # 相對面積噪點門檻
+  min_valid_dim: 0.008              # 相對邊長噪點門檻
+  error_bonus: 10.0                 # 錯誤樣本權重獎勵
+  edge_penalty: -0.6                # 靠近邊緣的樣本懲罰權重
+  scene_cap_close_only: 2           # 單一場景純關閉樣本上限
+
+# =====================================================================
+# 3. 資料增強策略 (Data Augmentation)
+# =====================================================================
+augment:
+  base_multiplier: 3                # 基礎增強倍率
+  close_fp_like_multiplier: 2       # 針對複雜關閉場景的強化
+  hard_negative_multiplier: 4       # 強化背景抗干擾能力
+  open_hard_threshold: 0.05         # 定義「困難 Open」的門檻

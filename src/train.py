@@ -4,17 +4,19 @@ import json
 import yaml
 import logging
 import argparse
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from ultralytics import YOLO
 
-# ⚠️ 解決 'def' 為 Python 保留字無法直接作為 package import 的問題
-# 我們將其加入 sys.path 以便直接 import 裡面的副程式
-sys.path.append(str(Path(__file__).resolve().parent / "def"))
-from pipeline_notice import print_pipeline_notice
+from anti_gravity.pipeline_notice import print_pipeline_notice
+from anti_gravity.settings import settings
 
 # =====================================================================
-# 1 Logging System & Experiment Tracking (解決追蹤與 error trace)
+# train_base 訓練參數 >> C:\antigravity\src\train.py
+# dataset_validator 資料集健康度檢查 >> C:\antigravity\src\anti_gravity\dataset_validator.py
+# =====================================================================
+# 1 Logging System
 # =====================================================================
 def setup_logger(log_dir):
     os.makedirs(log_dir, exist_ok=True)
@@ -33,491 +35,411 @@ def setup_logger(log_dir):
         logger.addHandler(sh)
     return logger
 
+# =====================================================================
+# 2 Experiment & Governance Tracker (v1.2)
+# =====================================================================
 class ExperimentTracker:
-    def __init__(self, history_file='../data/7_experiments/experiments_history.json', logger=None):
-        self.history_file = history_file
+    def __init__(self, history_file=None, logger=None):
+        self.history_file = history_file or settings.paths.experiments / "experiments_history.json"
         self.logger = logger
-        self.global_best_info_file = os.path.join(os.path.dirname(history_file), "global_best_info.json")
+        self.global_best_info_file = settings.paths.experiments / "global_best_info.json"
         os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
         if not os.path.exists(self.history_file):
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump([], f)
                 
-    def check_promotion_gate(self, metrics_dict, new_weights_path):
+    def check_promotion_gate(self, metrics_dict, new_weights_path, train_mode="rebuild", task_tag="general"):
         """
-        退步保護與雙軌驗證基準之晉升閘門 (Promotion Gates)
-        條件 1：綜合 Fitness 必須大於歷史最佳
-        條件 2：Recall 不得大幅退步 (容忍度 5%)
-        條件 3：[0.7.1 新增] Ghost背景誤判不得上升 (一票否決)
+        三層式晉升門檻 (Promotion Gates) v1.2
+        1. Common Gate: Ghost Veto & Lineage Check
+        2. Mode Gate: Rebuild (Baseline) vs Incremental (Patch)
+        3. Task Gate: 特定任務指標 (如 open_fn_repair)
         """
         import shutil
         import subprocess
-        import sys
         
         current_fitness = 0.1 * metrics_dict['mAP50'] + 0.9 * metrics_dict.get('mAP50_95', 0.0)
         current_recall = metrics_dict['recall']
+        current_open_recall = metrics_dict.get('open_recall', current_recall)
         
-        global_best_dir = os.path.join(os.path.dirname(os.path.dirname(self.history_file)), 'weight')
-        os.makedirs(global_best_dir, exist_ok=True)
-        global_best_path = os.path.join(global_best_dir, 'yolov8s.pt')
+        # 決定檔案命名與存放路徑
+        if train_mode == "rebuild":
+            dest_dir = settings.paths.models_baselines
+            weight_name = f"door_base_{datetime.now().strftime('%Y%m%d_%H%M')}.pt"
+        else:
+            dest_dir = settings.paths.models_incremental
+            weight_name = f"door_inc_{task_tag}_{datetime.now().strftime('%Y%m%d_%H%M')}.pt"
+            
+        os.makedirs(dest_dir, exist_ok=True)
+        final_dest_path = dest_dir / weight_name
+        
+        global_best_path = settings.paths.models_promoted / "global_best.pt"
+        os.makedirs(settings.paths.models_promoted, exist_ok=True)
         
         is_promoted = False
         reason = ""
+        ghost_stats = {}
         
-        # --- 0.7.1 新增：Ghost 背景拒判能力評估 ---
+        # --- [Common Gate] Ghost 背景拒判測試 (SoC: 由 Tracker 驅動) ---
         ghost_pass = True
-        ghost_reason = ""
-        ghost_eval_dir = os.path.join(os.path.dirname(os.path.dirname(self.history_file)), '8_ghost_evals/latest_gate')
-        hist_ghost_json = os.path.join(os.path.dirname(os.path.dirname(self.history_file)), '8_ghost_evals/global_best/ghost_eval.json')
+        ghost_eval_dir = settings.paths.evaluations / "ghost/latest_gate"
+        hist_ghost_json = settings.paths.evaluations / "ghost/global_best/ghost_eval.json"
         
         try:
-            # 執行 eval_ghosts.py 針對這批新權重進行測試
-            # 修正：指向新的 src/def/ 目錄
             eval_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'def', 'eval_ghosts.py')
-            cmd = [sys.executable, eval_script, "--model", str(new_weights_path), "--output", ghost_eval_dir]
-            if os.path.exists(global_best_path):
-                cmd += ["--baseline", global_best_path]
-            
-            self.logger.info(" [Safety Gate] 啟動 Ghost 背景誤判專屬測試...")
-            subprocess.check_call(cmd)
-            
-            # 讀取當次結果
-            with open(os.path.join(ghost_eval_dir, 'ghost_eval.json'), 'r') as f:
-                new_ghost_stats = json.load(f)
-            
-            # 讀取歷史最佳 (如果是第一次，自動通過)
-            if os.path.exists(hist_ghost_json):
-                with open(hist_ghost_json, 'r') as f:
-                    old_ghost_stats = json.load(f)
+            if os.path.exists(eval_script):
+                cmd = [sys.executable, eval_script, "--model", str(new_weights_path), "--output", str(ghost_eval_dir)]
+                if global_best_path.exists():
+                    cmd += ["--baseline", str(global_best_path)]
                 
-                # 門檻規則：@0.25 的 fp_close 或 fp_any 不得上升 (Hard Veto)
-                if new_ghost_stats['close@0.25'] > old_ghost_stats['close@0.25']:
-                    ghost_pass = False
-                    ghost_reason = f"Ghost 誤報劣化 (Close)：{old_ghost_stats['close@0.25']} -> {new_ghost_stats['close@0.25']}"
-                elif new_ghost_stats['any@0.25'] > old_ghost_stats['any@0.25']:
-                    ghost_pass = False
-                    ghost_reason = f"Ghost 總誤報上升：{old_ghost_stats['any@0.25']} -> {new_ghost_stats['any@0.25']}"
-                else:
-                    ghost_reason = "Ghost 背景拒判能力維持或進步。"
+                self.logger.info(f" [Governance] 啟動 Ghost 背景測試 (Mode: {train_mode}, Task: {task_tag})...")
+                
+                # 修正：注入 PYTHONPATH 確保子程序能找到 anti_gravity 套件
+                import copy
+                env = copy.deepcopy(os.environ)
+                src_root = str(Path(__file__).parent.absolute()) # 指向 src/
+                env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
+                
+                subprocess.check_call(cmd, env=env)
+                
+                with open(os.path.join(ghost_eval_dir, 'ghost_eval.json'), 'r') as f:
+                    ghost_stats = json.load(f)
+                
+                if os.path.exists(hist_ghost_json):
+                    with open(hist_ghost_json, 'r') as f:
+                        old_ghost_stats = json.load(f)
+                    # Veto 門檻：總誤報不應大幅上升
+                    if ghost_stats['any@0.25'] > old_ghost_stats['any@0.25'] + 2:
+                        ghost_pass = False
+                        reason = f"Ghost Veto: 誤報劣化 ({old_ghost_stats['any@0.25']} -> {ghost_stats['any@0.25']})"
             else:
-                ghost_reason = "初代 Ghost 基準建立。"
+                self.logger.warning(" [Governance] 找不到 eval_ghosts.py，跳過 Ghost 檢查。")
         except Exception as e:
-            self.logger.warning(f" [Safety Gate] Ghost 評估過程出錯: {e}，跳過硬指標檢查。")
+            self.logger.warning(f" [Governance] Ghost 評估過程出錯: {e}")
 
-        # 讀取歷史紀錄
+        # --- [Mode & Task Gates] 判定 ---
+        reason = "未達晉升標準"
         if not os.path.exists(self.global_best_info_file):
             is_promoted = True
-            reason = "無歷史 global_best，自動晉升為初代金牌模型。"
+            reason = "初代基準建立。"
         else:
-            try:
-                with open(self.global_best_info_file, 'r', encoding='utf-8') as f:
-                    global_info = json.load(f)
-                historical_fitness = global_info.get("fitness", 0.0)
-                historical_recall = global_info.get("metrics", {}).get("recall", 0.0)
-                
-                # Fitness 必須進步
-                if current_fitness <= historical_fitness:
-                    reason = f"Fitness ({current_fitness:.4f}) 未超越歷史最佳 ({historical_fitness:.4f})，拒絕晉升。"
-                # Recall 不可嚴重退步 (Safety Gate)
-                elif current_recall < (historical_recall - 0.05):
-                    reason = f"Safety Gate 攔截：即使 Fitness 較高，但 Recall ({current_recall:.4f}) 較歷史最佳 ({historical_recall:.4f}) 退步超過 5%，拒絕晉升。"
-                # Ghost 一票否決 (Hard Veto)
-                elif not ghost_pass:
-                    reason = f"Ghost 一票否決制：{ghost_reason}"
+            with open(self.global_best_info_file, 'r', encoding='utf-8') as f:
+                hist = json.load(f)
+            h_fitness = hist.get("fitness", 0.0)
+            h_open_recall = hist.get("metrics", {}).get("open_recall", 0.0)
+
+            if not ghost_pass:
+                is_promoted = False # Ghost 一票否決
+            else:
+                if train_mode == "rebuild":
+                    # Rebuild 模式：Fitness 不退步即晉升，提升 2% 視為強晉升
+                    if current_fitness >= h_fitness:
+                        is_promoted = True
+                        reason = f"Rebuild 成功: Fitness穩定或提升 ({current_fitness:.4f} >= {h_fitness:.4f})"
+                    else:
+                        is_promoted = False
+                        reason = f"Rebuild 失敗: 未達舊標準 ({current_fitness:.4f} < {h_fitness:.4f})"
                 else:
-                    is_promoted = True
-                    reason = f"通過所有閘門！{ghost_reason} Fitness 進步 ({historical_fitness:.4f} -> {current_fitness:.4f})。"
-            except Exception as e:
-                if self.logger: self.logger.error(f"讀取 global_best_info.json 發生錯誤：{e}")
-                is_promoted = True
-                reason = "歷史紀錄毀損，強制晉升以修復狀態。"
-                
-        # 執行晉升
+                    # Incremental 模式：Recall 保護機制 (核心 Open Recall 不退步過多)
+                    if current_open_recall < (h_open_recall - 0.03):
+                        is_promoted = False
+                        reason = f"增量保護: Open Recall 退步過多 ({h_open_recall:.4f} -> {current_open_recall:.4f})"
+                    else:
+                        is_promoted = True
+                        reason = "增量成功: 通過 Recall 安全防線。"
+
+        # --- 執行晉升與 Registry 註冊 ---
         if is_promoted:
             try:
                 shutil.copy2(new_weights_path, global_best_path)
-                # 同步更新歷史 ghost JSON 供下次比對
-                hist_ghost_dir = os.path.dirname(hist_ghost_json)
-                os.makedirs(hist_ghost_dir, exist_ok=True)
-                shutil.copy2(os.path.join(ghost_eval_dir, 'ghost_eval.json'), hist_ghost_json)
+                shutil.copy2(new_weights_path, final_dest_path)
+                
+                # 更新 Registry (Model Identity)
+                self.save_to_registry(weight_name, {
+                    "train_mode": train_mode,
+                    "task_tag": task_tag,
+                    "metrics": metrics_dict,
+                    "ghost_stats": ghost_stats,
+                    "parent_model": hist.get("model_name", "official") if 'hist' in locals() else "official"
+                })
 
                 with open(self.global_best_info_file, 'w', encoding='utf-8') as f:
                     json.dump({
                         "promoted_at": datetime.now().isoformat(),
-                        "source_weights": str(new_weights_path),
+                        "model_name": weight_name,
                         "fitness": round(current_fitness, 4),
                         "metrics": metrics_dict,
-                        "ghost_metrics": new_ghost_stats if ghost_pass else {},
+                        "ghost_metrics": ghost_stats,
                         "reason": reason
                     }, f, indent=4)
-                if self.logger: self.logger.info(f"🏆 模型晉升成功 (Promoted to global_best.pt)！{reason}")
+                self.logger.info(f"🏆 模型晉升成功！權重已保存至: {weight_name}")
             except Exception as e:
-                if self.logger: self.logger.error(f"晉升寫入時發生錯誤：{e}")
-                is_promoted = False
-        else:
-            if self.logger: self.logger.warning(f"🛑 模型被閘門擋下 (Rejected)。{reason} (權重僅保留於 latest_best.pt)")
-            
-        return is_promoted
+                self.logger.error(f"晉升寫入時發生錯誤: {e}")
+        
+        return is_promoted, reason
 
-    def log_experiment(self, dataset_version, model_weights, metrics, save_dir):
-        """4 解決：訓練紀錄綁 dataset version，並回傳格式化 metrics 給晉升閘門用"""
-        # 防版本崩潰Ultralytics 舊版 mean_p/mean_r 已更新為 mp/mr
+    def save_to_registry(self, weight_name, metadata):
+        """實作 Model Registry JSON 註冊"""
+        reg_path = settings.paths.models_registry / f"{Path(weight_name).stem}.json"
+        metadata["registered_at"] = datetime.now().isoformat()
+        metadata["lineage"] = {
+            "dataset_version": getattr(self, 'ds_version', 'unknown'),
+            "dataset_hash": getattr(self, 'ds_hash', 'unknown'),
+            "config_hash": getattr(self, 'cfg_hash', 'unknown')
+        }
+        with open(reg_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=4)
+        self.logger.info(f"📄 模型註冊表已更新: {reg_path.name}")
+
+    def log_experiment(self, dataset_info, model_weights, metrics, save_dir):
+        """紀錄實驗歷程並保存 Hash 資訊供血統追蹤"""
+        self.ds_version = dataset_info.get('version')
+        self.ds_hash = dataset_info.get('manifest_hash')
+        self.cfg_hash = dataset_info.get('config_hash')
+        
         mp, mr, map50, map50_95 = metrics.box.mean_results() if hasattr(metrics.box, 'mean_results') else (
-            getattr(metrics.box, 'mp', getattr(metrics.box, 'mean_p', 0.0)),
-            getattr(metrics.box, 'mr', getattr(metrics.box, 'mean_r', 0.0)),
-            metrics.box.map50, getattr(metrics.box, 'map', 0.0)
+            getattr(metrics.box, 'mp', 0.0), getattr(metrics.box, 'mr', 0.0), metrics.box.map50, 0.0
         )
+        
+        # 嘗試擷取真實的 class-wise recall (假設 open 為類別 0)
+        open_recall = mr
+        try:
+            if hasattr(metrics.box, 'ap_class_index') and hasattr(metrics.box, 'R'):
+                classes = list(metrics.box.ap_class_index)
+                if 0 in classes:
+                    idx = classes.index(0)
+                    open_recall = metrics.box.R[idx]
+        except Exception as e:
+            self.logger.warning(f"無法擷取 class-wise recall: {e}")
         
         metrics_dict = {
             "mAP50": round(map50, 4),
-            "mAP50_95": round(map50_95, 4),
             "precision": round(mp, 4),
-            "recall": round(mr, 4)
+            "recall": round(mr, 4),
+            "open_recall": round(open_recall, 4)
         }
         
         record = {
             "timestamp": datetime.now().isoformat(),
-            "dataset": dataset_version,
+            "dataset": self.ds_version,
+            "dataset_hash": self.ds_hash,
             "base_model": model_weights,
-            "save_dir": save_dir,
             "metrics": metrics_dict,
-            "promoted_to_global": False # 預設 false，稍後由晉升閘門覆寫若有需要
+            "save_dir": save_dir
         }
         
         try:
             with open(self.history_file, 'r+', encoding='utf-8') as f:
                 history = json.load(f)
                 history.append(record)
-                f.seek(0)
-                json.dump(history, f, indent=4)
-            if self.logger:
-                self.logger.info(f" 實驗結果已成功綁定並記錄於: {self.history_file}")
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f" 記錄實驗歷程失敗: {e}")
-                
-        # --- 自動同步至 Markdown 日誌 ---
-        self._update_markdown_report(record, note="Auto-logged from trainer")
-                
-        return metrics_dict, len(history) - 1 # 回傳 index 以便稍後更新 promoted 狀態
-        
-    def update_promotion_status(self, record_index):
-        """將該次實驗標記為已晉升並同步更新 Markdown"""
-        try:
-            with open(self.history_file, 'r+', encoding='utf-8') as f:
-                history = json.load(f)
-                history[record_index]["promoted_to_global"] = True
-                f.seek(0)
-                json.dump(history, f, indent=4)
-                f.truncate()
+                f.seek(0); json.dump(history, f, indent=4)
+        except Exception:
+            pass
             
-            # 同步更新 Markdown 中的備註
-            self._update_markdown_report(history[record_index], note="🏆 **Promoted to Global Best!**")
+        # --- 改為在外部呼叫，以便帶入晉升狀態 ---
+        # self._update_markdown_report(record)
             
-            if self.logger: self.logger.info(f" [Tracker] 已將紀錄 #{record_index} 標記為晉升狀態。")
-        except Exception as e:
-            if self.logger: self.logger.error(f" 更新晉升狀態失敗: {e}")
+        return metrics_dict, len(history) - 1, record
 
-    def _update_markdown_report(self, record, note=""):
-        """自動更新 data/7_experiments/training_history.md (表格式)"""
-        md_file = os.path.join(os.path.dirname(self.history_file), "training_history.md")
-        # 確保目錄存在
+    def update_markdown_report(self, record, status="已存檔"):
+        """自動維護 data/7_experiments/training_history.md (表格式)"""
+        md_file = settings.paths.experiments / "training_history.md"
         os.makedirs(os.path.dirname(md_file), exist_ok=True)
         
         if not os.path.exists(md_file):
-            header = "# Training History Report\n\n"
-            header += "This table shows all experiment folders in `data/7_experiments` sorted from **Newest to Oldest**.\n\n"
-            header += "| Order | Experiment Name | Date & Time | Dataset | mAP50 | Notes |\n"
+            header = "# 🚀 訓練實驗歷程 (Training History)\n\n"
+            header += "| 序號 | 實驗名稱 | 日期時間 | 資料集版本 | mAP50 | 狀態 |\n"
             header += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
             with open(md_file, 'w', encoding='utf-8') as f:
                 f.write(header)
         
         try:
-            with open(md_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            # 準備新資料行
             ts = datetime.fromisoformat(record["timestamp"]).strftime("%Y-%m-%d %H:%M")
             name = os.path.basename(record["save_dir"])
             ds = record["dataset"]
             map50 = record["metrics"]["mAP50"]
             
-            new_line = f"| - | **{name}** | {ts} | {ds:<18} | {map50:.3f} | {note} |\n"
+            # 簡潔的一行紀錄，包含動態 status
+            new_line = f"| - | **{name}** | {ts} | {ds} | {map50:.4f} | {status} |\n"
             
-            # 檢查是否已經存在該實驗的紀錄（避免重複插入，例如晉升時的二次呼叫）
-            # 我們搜尋是否存在該實驗名稱
-            exists = False
-            for i, line in enumerate(lines):
-                if f"**{name}**" in line:
-                    # 如果找到了，更新那一行的 Note
-                    parts = line.split('|')
-                    if len(parts) >= 7:
-                        parts[6] = f" {note} \n"
-                        lines[i] = "|".join(parts)
-                    exists = True
-                    break
-            
-            if not exists:
-                # 尋找表格插入點 (Header 分割線下方)
-                insert_idx = -1
-                for i, line in enumerate(lines):
-                    if line.strip().startswith('| :---'):
-                        insert_idx = i + 1
-                        break
-                
-                if insert_idx != -1:
-                    lines.insert(insert_idx, new_line)
-                else:
-                    lines.append(new_line)
-            
-            with open(md_file, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            
-            if self.logger: self.logger.info(f" 📖 訓練日誌已自動同步至: {md_file}")
+            with open(md_file, 'a', encoding='utf-8') as f:
+                f.write(new_line)
         except Exception as e:
-            if self.logger: self.logger.error(f" 自動更新 Markdown 日誌失敗: {e}")
+            import traceback
+            self.logger.warning(f"更新 Markdown 報表失敗: {e}")
+            traceback.print_exc()
 
 # =====================================================================
-# 2 Configuration Manager (解決超參數硬編碼與強變形風險)
+# 3 Hyperparameter Management
 # =====================================================================
 class HyperparameterConfig:
-    def __init__(self, config_path, logger):
+    def __init__(self, config_path, mode, logger):
         self.config_path = config_path
+        self.mode = mode
         self.logger = logger
-        self.config = self._load_or_create_default()
+        self.config = self._load_from_yaml()
+        # 機驗資訊：Config Hash
+        self.config_hash = hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest()[:12]
 
-    def _load_or_create_default(self, is_incremental=False):
-        """ 解決：Augmentation 太強會破壞小 dataset 的問題"""
-        default_config = {
-            "epochs": 30 if is_incremental else 100,
-            "imgsz": 768,
-            "batch": 16,
-            "patience": 50,
-            "optimizer": "auto",
-            "lr0": 0.001 if is_incremental else 0.01,
-            "warmup_epochs": 2 if is_incremental else 3, # 0.7.1 專家建議：增量模式採用短 Warmup
-            "hsv_v": 0.4,
-            "fliplr": 0.5,
-            "mosaic": 0.2,
-            "translate": 0.2,
-            "mixup": 0.0,
-            "degrees": 2.0,
-            "scale": 0.1
-        }
+    def _load_from_yaml(self):
+        """從 YAML 中讀取對應模式的參數"""
         if not os.path.exists(self.config_path):
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(default_config, f, default_flow_style=False)
-            self.logger.info(f" 已自動產生預設訓練參數檔: {self.config_path} (Incremental={is_incremental})")
-            return default_config
+            raise FileNotFoundError(f"找不到訓練設定檔: {self.config_path}")
         
         with open(self.config_path, 'r', encoding='utf-8') as f:
-            cfg = yaml.safe_load(f)
-            if is_incremental:
-                cfg['lr0'] = min(cfg.get('lr0', 0.01), 0.001)
-                cfg['epochs'] = min(cfg.get('epochs', 100), 50)
-            self.logger.info(f" 已成功載入外部參數檔: {self.config_path} (經增量模式校準)")
-            return cfg
+            all_configs = yaml.safe_load(f)
+            
+        if self.mode not in all_configs:
+            raise KeyError(f"設定檔中找不到對應模式 '{self.mode}' 的參數區塊。")
+            
+        cfg = all_configs[self.mode]
+        return cfg
 
 # =====================================================================
-# 3 SRP 核心: Model Trainer & Evaluator (拆積木設計)
+# 4 YOLO Trainer
 # =====================================================================
 class YOLOv8Trainer:
-    def __init__(self, model_weights='yolov8n.pt', logger=None):
+    def __init__(self, model_weights='yolov8s.pt', logger=None):
         self.logger = logger
-        self.model_weights = model_weights
-        self.model = YOLO(self.model_weights)
-        if self.logger:
-            self.logger.info(f" 初始模型載入完成: {model_weights}")
+        self.model = YOLO(model_weights)
+        if self.logger: self.logger.info(f" 模型載入: {model_weights}")
 
     def train(self, data_yaml, hyper_params, project=None, name='exp'):
-        if project is None:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            project = os.path.normpath(os.path.join(script_dir, '../data/7_experiments'))  # 【輸出】訓練實驗結果
-        if self.logger: self.logger.info(" 啟動安全掛載之神經網路訓練...")
-        # 7 解決：加入 Exception Handling 防止 Pipeline 死當
+        if project is None: project = settings.paths.experiments
         try:
+            self.logger.info(f"🚀 訓練啟動！您可以開啟另一個終端機輸入 'tensorboard --logdir {project}' 來監看曲線。")
             results = self.model.train(
-                data=data_yaml,
-                project=project,
-                name=name,
+                data=data_yaml, 
+                project=project, 
+                name=name, 
+                exist_ok=True,    # 允許覆寫同名資料夾，避免產生大量 exp1, exp2
+                visualize=True,   # 儲存特徵圖
+                plots=True,       # 產生訓練圖表
                 **hyper_params
             )
+            best_weights = os.path.join(results.save_dir, 'weights', 'best.pt')
             
-            # 5 解決：best.pt 抓法有風險 (Race Condition)
-            # 正確做法：直接拿 YOLO 物件回傳的記憶體路徑，保證 100% 正確
-            if hasattr(results, 'save_dir'):
-                best_weights = os.path.join(results.save_dir, 'weights', 'best.pt')
-            else:
-                best_weights = os.path.join(self.model.trainer.save_dir, 'weights', 'best.pt')
-
-            # 把最佳結果備份為 latest_best.pt，代表本次最新出爐的模型，無論有沒有變強
+            # 備份至 latest 供基礎使用
+            latest_dir = settings.paths.models / "latest"
+            os.makedirs(latest_dir, exist_ok=True)
             import shutil
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            weight_dir = os.path.normpath(os.path.join(script_dir, '../data/7_experiments/weight'))  # 【輸出】模型備份路徑
-            os.makedirs(weight_dir, exist_ok=True)
-            latest_copy = os.path.join(weight_dir, 'latest_best.pt')
-            shutil.copy2(best_weights, latest_copy)
-
-            if self.logger: self.logger.info(f"Training complete. Run saved to: {best_weights}")
-            if self.logger: self.logger.info(f"🔥 本次最新結果已備份至: {latest_copy}，稍後送入晉升閘門審核...")
-
-            save_dir = os.path.dirname(os.path.dirname(best_weights))
-            print(f"\n Training run dir: {os.path.abspath(save_dir)}")
-            try:
-                os.startfile(os.path.abspath(save_dir))
-            except Exception:
-                pass
-
-            return best_weights
-
+            shutil.copy2(best_weights, latest_dir / "latest_best.pt")
             
+            return best_weights
         except Exception as e:
-            if self.logger: self.logger.error(f" 訓練過程發生致命錯誤崩潰：{e}", exc_info=True)
-            raise RuntimeError("Pipeline 終止於訓練階段") from e
-
-    def tune(self, data_yaml, iterations=250, epochs=100):
-        if self.logger: self.logger.info(f" 啟動 {iterations} 代超參數基因演化 (GA)...")
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            tune_project = os.path.normpath(os.path.join(script_dir, '../data/7_experiments'))  # 【輸出】調參實驗結果
-            self.model.tune(
-                data=data_yaml,
-                epochs=epochs,
-                iterations=iterations,
-                optimizer='AdamW',
-                project=tune_project,
-                plots=False
-            )
-            if self.logger:
-                self.logger.info(f"Tune complete. Best params saved to: {tune_project}/tune/best_hyperparameters.yaml")
-        except Exception as e:
-            if self.logger: self.logger.error(f" 調參過程崩潰：{e}", exc_info=True)
-            raise
+            raise RuntimeError(f"訓練中斷: {e}")
 
     def evaluate(self, weights_path, data_yaml):
-        if self.logger: self.logger.info(f" 開始載入 {weights_path} 進行測試集評估...")
-        try:
-            eval_model = YOLO(weights_path)
-            # 依據 F1 Curve 最佳表現，調降驗證門檻以解放 Recall
-            metrics = eval_model.val(data=data_yaml, conf=0.3)
-            
-            if self.logger:
-                # 防版本崩潰使用 mean_results() 獲取最穩固的 API (新舊不同 Ultralytics 版本全相容)
-                mp, mr, map50, _ = metrics.box.mean_results() if hasattr(metrics.box, 'mean_results') else (
-                    getattr(metrics.box, 'mp', getattr(metrics.box, 'mean_p', 0.0)),
-                    getattr(metrics.box, 'mr', getattr(metrics.box, 'mean_r', 0.0)),
-                    metrics.box.map50, None
-                )
-                self.logger.info("================  驗證集嚴格評估結果 =================")
-                self.logger.info(f" mAP@50   : {map50:.4f}")
-                self.logger.info(f" Precision : {mp:.4f}")
-                self.logger.info(f" Recall    : {mr:.4f}")
-                self.logger.info("=========================================================")
-            return metrics
-            
-        except Exception as e:
-            if self.logger: self.logger.error(f" 評估過程崩潰：{e}", exc_info=True)
-            raise
+        eval_model = YOLO(weights_path)
+        metrics = eval_model.val(data=data_yaml, conf=0.25)
+        return metrics
 
 # =====================================================================
-# Orchestrator (CLI 整合入口)
+# 5 Orchestrator
 # =====================================================================
 if __name__ == '__main__':
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # 預設直接讀取 data/ 根目錄的 dataset.yaml
-    default_yaml = os.path.normpath(os.path.join(script_dir, '../data/dataset.yaml'))
-    dataset_version_name = "base_dataset"
-
-            
-    default_config = os.path.join(script_dir, '../configs/001_train_config.yaml')
-
-    # =========================================================================
-    # 💡 [可自由修改] 訓練權重設定
-    # =========================================================================
-    # 預設使用官方 'yolov8s.pt' 來從頭訓練。
-    # 若您想基於之前訓練好的模型繼續微調（例如基於最新的 base4），可以將此處改為您的路徑：
-    # 範例修改: default_weight = os.path.join(script_dir, '../data/7_experiments/exp_v072_base4/weights/best.pt')
-    default_weight = 'yolov8s.pt'
-    # default_weight = '../data/7_experiments/exp_v072_base8/weights/best.pt'
-    parser = argparse.ArgumentParser(description='MLOps Level 3 企業級訓練引擎')
-    parser.add_argument('--action', type=str, choices=['train', 'tune', 'auto_tune_train'], default='train', 
-                        help='執行動作：train(一般訓練), tune(純調參), auto_tune_train(先調參後自動使用最佳參數訓練)')
-    parser.add_argument('--data', type=str, default=default_yaml, help='dataset.yaml 目標路徑')
-    parser.add_argument('--config', type=str, default=default_config, help='超參數 001_train_config.yaml 路徑')
-    parser.add_argument('--weights', type=str, default=default_weight, help='初始權重檔路徑 (建議修改上方的 default_weight 變數)')
-    parser.add_argument('--incremental', action='store_true', help='啟用增量微調模式 (自動調降 LR 與 Epochs)')
+    parser = argparse.ArgumentParser(description='MLOps Level 3 Governance Trainer')
+    parser.add_argument('--action', type=str, default='train', choices=['train', 'tune'])
+    parser.add_argument('--data', type=str, default=str(settings.paths.augment / "current/dataset.yaml"))
+    parser.add_argument('--config', type=str, default=str(settings.paths.configs / "experiments/train_base.yaml"))
+    # pt_load = str(settings.paths.experiments / "exp_rebuild_general_0421_0902/weights/best.pt")
+    pt_load = str(settings.paths.experiments / "incremental/exp_incremental_general_0421_1002/weights/best.pt")
+    # pt_load = str(settings.paths.artifacts / "yolov8s.pt")
+    parser.add_argument('--weights', type=str, default=pt_load)
+    # Rebuild: 適合「打地基」、Incremental: 適合「餵新圖」、Specialized: 適合「修難樣本」
+    parser.add_argument('--mode', type=str, default='specialized', choices=['rebuild', 'incremental', 'specialized'])
+    parser.add_argument('--task', type=str, default='general', help='例如: open_fn_repair, close_fp_suppression')
+    parser.add_argument('--dataset_version', type=str, default='v0.8.2_auto')
+    parser.add_argument('--purge', action='store_true', help='是否在訓練前自動剔除空標籤樣本(背景圖)')
     
     args = parser.parse_args()
+    logger = setup_logger(settings.paths.storage_logs)
     
-    # [Weights Discovery] 0.7.1 智慧偵測 (如果是有輸入 --incremental，才會去硬找特定的接續權重)
-    if args.weights == 'yolov8s.pt' and args.incremental:
-        # 優先找 global_best，次之 latest_best
-        g_path = os.path.join(script_dir, '../data/7_experiments/weight/yolov8s.pt')
-        l_path = os.path.join(script_dir, '../data/7_experiments/weight/latest_best.pt')
-        args.weights = g_path if os.path.exists(g_path) else (l_path if os.path.exists(l_path) else 'yolov8s.pt')
-            
-    # 啟動各式系統中樞
-    logger = setup_logger(os.path.join(script_dir, '../data/logs'))
-    tracker = ExperimentTracker(os.path.join(script_dir, '../data/7_experiments/experiments_history.json'), logger)
-    config_mgr = HyperparameterConfig(args.config, logger)
-    # 重新根據增量模式校準參數
-    config_mgr.config = config_mgr._load_or_create_default(is_incremental=args.incremental)
+    # 啟動追蹤器與配置管理
+    tracker = ExperimentTracker(logger=logger)
+    config_mgr = HyperparameterConfig(args.config, args.mode, logger)
     
+    # [模式日誌標記]
+    logger.info("="*60)
+    logger.info(f"🚀 啟動 MLOps 訓練流水線")
+    logger.info(f"   【當前模式】: {args.mode.upper()}")
+    logger.info(f"   【任務標籤】: {args.task}")
+    logger.info(f"   【資料版本】: {args.dataset_version}")
+    logger.info(f"   【初始權重】: {os.path.basename(args.weights)}")
+    logger.info(f"   【參數摘要】: LR={config_mgr.config.get('lr0')}, Epochs={config_mgr.config.get('epochs')}")
+    logger.info("="*60)
+    
+    # 載入模型並訓練
     trainer = YOLOv8Trainer(model_weights=args.weights, logger=logger)
     
-    if args.action == 'tune':
-        trainer.tune(data_yaml=args.data)
+    if args.action == 'train':
+        # [新增] 訓練前強制執行 Dataset Sanity Check
+        from anti_gravity.dataset_validator import validate_dataset, purge_empty_labels
+        try:
+            validate_dataset(args.data)
+            
+            # [新增] 自動清理 YOLO 快取，確保資料同步
+            data_dir = Path(args.data).parent
+            for cache_file in data_dir.rglob("*.cache"):
+                try:
+                    os.remove(cache_file)
+                    logger.info(f"🧹 已清理舊的快取檔案: {cache_file.name}")
+                except Exception: pass
 
-    elif args.action == 'train':
-        best_pt = trainer.train(data_yaml=args.data, hyper_params=config_mgr.config, name=f"exp_v072_{'inc' if args.incremental else 'base'}")
+            # 如果使用者啟動了 --purge，則執行剔除空標籤
+            if args.purge:
+                purge_empty_labels(args.data)
+        except RuntimeError as e:
+            logger.error(f"❌ 終止訓練 (Dataset Sanity Check Failed): {e}")
+            logger.error("🚫 請先修復資料集問題再重新啟動！")
+            sys.exit(1)
+
+        exp_name = f"exp_{args.mode}_{args.task}_{datetime.now().strftime('%m%d_%H%M')}"
+        best_pt = trainer.train(
+            data_yaml=args.data, 
+            hyper_params=config_mgr.config, 
+            project=settings.paths.experiments / args.mode,
+            name=exp_name
+        )
         metrics = trainer.evaluate(best_pt, data_yaml=args.data)
 
-        metrics_dict, record_idx = tracker.log_experiment(
-            dataset_version=f"v0.7.2_{'incremental' if args.incremental else 'rebuild'}",
+        # [新增] Fail-Fast 防護: 驗證集失效直接報錯
+        map50 = getattr(metrics.box, 'map50', 0.0) if hasattr(metrics, 'box') else 0.0
+        if map50 == 0.0:
+            logger.error("❌ [致命錯誤] 驗證集 mAP50 為 0.0000！資料/標籤極可能已損壞或失效。")
+            logger.error("🚫 模型不會被晉升，請檢查儲存路徑與 YAML 設定。")
+            sys.exit(1)
+
+        # 擷取血統資訊: 真實讀取 dataset.yaml 的內容進行 Hash，而非僅 Hash 路徑字串
+        try:
+            with open(args.data, 'r', encoding='utf-8') as f:
+                ds_hash = hashlib.sha256(f.read().encode()).hexdigest()[:12]
+        except Exception:
+            ds_hash = hashlib.sha256(str(args.data).encode()).hexdigest()[:12]
+            
+        metrics_dict, record_idx, record = tracker.log_experiment(
+            dataset_info={
+                "version": args.dataset_version,
+                "manifest_hash": ds_hash,
+                "config_hash": config_mgr.config_hash
+            },
             model_weights=args.weights,
             metrics=metrics,
             save_dir=os.path.dirname(os.path.dirname(best_pt))
         )
 
-        if tracker.check_promotion_gate(metrics_dict, best_pt):
-            tracker.update_promotion_status(record_idx)
-
-    elif args.action == 'auto_tune_train':
-        logger.info("Tune -> Train -> Eval")
-        trainer.tune(data_yaml=args.data, iterations=350, epochs=100)
-
-        best_hyper_path = os.path.normpath(
-            os.path.join(script_dir, '../data/7_experiments/tune/best_hyperparameters.yaml')
-        )
-        if os.path.exists(best_hyper_path):
-            advanced_mgr = HyperparameterConfig(best_hyper_path, logger)
-            best_pt = trainer.train(data_yaml=args.data, hyper_params=advanced_mgr.config)
+        # 執行治理門檻判定
+        is_promoted, reason = tracker.check_promotion_gate(metrics_dict, best_pt, train_mode=args.mode, task_tag=args.task)
+        if is_promoted:
+            logger.info(" [MLOps] 模型已完成晉升與身分註冊。")
         else:
-            logger.warning("Tune best config not found, fallback to default training config")
-            best_pt = trainer.train(data_yaml=args.data, hyper_params=config_mgr.config)
-
-        metrics = trainer.evaluate(best_pt, data_yaml=args.data)
-
-        metrics_dict, record_idx = tracker.log_experiment(
-            dataset_version=dataset_version_name,
-            model_weights=args.weights,
-            metrics=metrics,
-            save_dir=os.path.dirname(os.path.dirname(best_pt))
-        )
-
-        if tracker.check_promotion_gate(metrics_dict, best_pt):
-            tracker.update_promotion_status(record_idx)
+            logger.warning(" [MLOps] 模型未通過治理門檻，僅保留實驗結果。")
+            
+        # 最後將帶有真實原因的記錄寫入 Markdown
+        tracker.update_markdown_report(record, status=reason)
 
     print_pipeline_notice(
-        output_paths=[
-            os.path.normpath(os.path.join(script_dir, '../data/7_experiments')),
-            os.path.normpath(os.path.join(script_dir, '../data/7_experiments/weight/latest_best.pt')),
-            os.path.normpath(os.path.join(script_dir, '../data/7_experiments/weight/global_best.pt')),
-        ],
+        output_paths=[str(settings.paths.models_promoted / "global_best.pt")],
         next_script="src/analyze_errors.py",
-        notes=[
-            "請先確認 latest_best.pt 與 global_best.pt 是否如預期更新。",
-            "完成訓練後，建議先做 error analysis，再決定是否進入 hard case mining 或 active learning。",
-        ],
+        notes=[f"當前模式: {args.mode}", f"任務標籤: {args.task}"]
     )

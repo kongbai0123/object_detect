@@ -1,246 +1,150 @@
-from __future__ import annotations
-
-import os
+﻿import cv2
+import torch
+import time
 import argparse
-import sys
-from datetime import datetime
 from pathlib import Path
-from time import perf_counter
-
-import cv2
+from collections import deque, Counter
 from ultralytics import YOLO
+from anti_gravity.settings import settings
+from anti_gravity.logger import logger
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT = SCRIPT_DIR.parent
-import sys
-from pathlib import Path
-# ⚠️ 解決 'def' 保留字問題
-sys.path.append(str(Path(__file__).resolve().parent / "def"))
-from pipeline_notice import print_pipeline_notice
+# =====================================================================
+# 🛠️ 雙軌決策參數 (Industrial Decision Parameters)
+# =====================================================================
+THRESHOLDS = {
+    0: 0.30,  # OPEN (較靈敏，確保 Recall)
+    1: 0.60   # CLOSE (較嚴格，確保 Precision)
+}
+# 偵測框的面積與畫面占比
+MIN_BOX_AREA_RATIO = 0.02
+MAX_BOX_AREA_RATIO = 0.75
 
+SMOOTHING_WINDOW = 10      # 投票窗口
+CONFIRM_RATIO = 0.6        # 60% 一致性即切換狀態
+# =====================================================================
 
-def find_best_model() -> Path:
+class IndustrialDecisionEngine:
     """
-    [Weights Discovery System] 動態搜尋當前系統最強大腦
-    優先級: global_best.pt > latest_best.pt > 最新 exp*/weights/best.pt
+    [Decision Engine] 雙軌判定，Open 具有優先決策權。
     """
-    runs_dir = ROOT / "data/7_experiments"
+    def __init__(self):
+        self.history = deque(maxlen=SMOOTHING_WINDOW)
+        self.stable_state = "CLOSE"
+        self.colors = {"OPEN": (0, 0, 255), "CLOSE": (0, 255, 0)}
+
+    def update(self, detections) -> str:
+        current_frame_opinion = None
+        
+        if detections:
+            # 優先權邏輯：只要偵測到合格的 OPEN，本影格傾向於 OPEN
+            opens = [d for d in detections if d['cls'] == 0]
+            if opens:
+                current_frame_opinion = "OPEN"
+            else:
+                current_frame_opinion = "CLOSE"
+        
+        if current_frame_opinion:
+            self.history.append(current_frame_opinion)
+        
+        # 投票決策
+        if self.history:
+            counts = Counter(self.history)
+            most_common, count = counts.most_common(1)[0]
+            if count >= (SMOOTHING_WINDOW * CONFIRM_RATIO):
+                self.stable_state = most_common
+                
+        return self.stable_state
+
+def process_video_industrial(model_path, video_path, output_path):
+    model = YOLO(model_path)
+    cap = cv2.VideoCapture(str(video_path))
     
-    # 策略 1: 冠軍模型 (經由 Promotion Gate 晉升) # global_best.pt
-    global_best = runs_dir / "exp_v072_base4/weights/best.pt"
-    if global_best.exists():
-        return global_best
-        
-    # 策略 2: 最新挑戰者模型
-    latest_challenger = runs_dir / "weights/latest_best.pt"
-    if latest_challenger.exists():
-        return latest_challenger
-        
-    # 策略 3: 遍歷所有 exp{num} 尋找最新修改時間的 best.pt
-    import glob
-    found = sorted(
-        glob.glob(str(runs_dir / "exp*/weights/best.pt"), recursive=True), 
-        key=os.path.getmtime
-    )
-    if found:
-        return Path(found[-1])
-        
-    # 策略 4: Fallback
-    return Path("yolov8n.pt")
-
-DEFAULT_MODEL = find_best_model()
-DEFAULT_OUTPUT_DIR = ROOT / "data/7_experiments/video_preds"
-DEFAULT_VIDEO_DIR = ROOT / "data/1_raw/videos"
-VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".MP4", ".MKV", ".AVI", ".MOV")
-
-
-def parse_source(source: str) -> int | str:
-    return int(source) if source.isdigit() else source
-
-
-def find_default_video_source() -> str | None:
-    if not DEFAULT_VIDEO_DIR.exists():
-        return None
-
-    candidates = []
-    for ext in VIDEO_EXTS:
-        candidates.extend(DEFAULT_VIDEO_DIR.glob(f"*{ext}"))
-
-    candidates = sorted({path.resolve() for path in candidates})
-    if not candidates:
-        return None
-    return str(candidates[0])
-
-
-def can_use_imshow() -> bool:
-    try:
-        cv2.namedWindow("test_window", cv2.WINDOW_NORMAL)
-        cv2.destroyWindow("test_window")
-        return True
-    except cv2.error:
-        return False
-
-
-def resolve_display_mode(mode: str) -> bool:
-    if mode == "always":
-        return True
-    if mode == "never":
-        return False
-    return can_use_imshow()
-
-
-def default_output_path(source: int | str, suffix: str) -> Path:
-    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if isinstance(source, int):
-        return DEFAULT_OUTPUT_DIR / f"camera_pred_{stamp}{suffix}"
-    return DEFAULT_OUTPUT_DIR / f"{Path(source).stem}_pred_{stamp}{suffix}"
-
-
-def open_capture(source: int | str) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        raise RuntimeError(f"cannot open source: {source}")
-    return cap
-
-
-def create_video_writer(cap: cv2.VideoCapture, output_path: Path) -> cv2.VideoWriter:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 25.0
+    frame_area = width * height
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    return cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    
+    engine = IndustrialDecisionEngine()
+    
+    logger.info(f"Industrial Dual-Track Detection: {video_path.name}")
 
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+        
+        # 1. 執行雙類別偵測
+        results = model.predict(frame, conf=0.2, classes=[0, 1], verbose=False)
+        
+        valid_detections = []
+        best_box = None
+        
+        for box in results[0].boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            xyxy = box.xyxy[0].tolist()
+            
+            # --- [過濾 1: 專屬閾值] ---
+            if conf < THRESHOLDS.get(cls, 0.5): continue
+            
+            # --- [過濾 2: 幾何約束] ---
+            x1, y1, x2, y2 = xyxy
+            area = (x2 - x1) * (y2 - y1)
+            if not (MIN_BOX_AREA_RATIO * frame_area < area < MAX_BOX_AREA_RATIO * frame_area):
+                continue
+            
+            valid_detections.append({'cls': cls, 'conf': conf, 'xyxy': xyxy})
 
-def run_video_inference(
-    model: YOLO,
-    source: int | str,
-    conf: float,
-    iou: float,
-    show_window: bool,
-    output_path: Path,
-) -> None:
-    cap = open_capture(source)
-    writer = create_video_writer(cap, output_path)
-    window_name = "Video PT Test (press q to quit)"
-    frame_count = 0
+        # 2. 引擎決策
+        state = engine.update(valid_detections)
+        
+        # 3. 渲染 UI
+        # A. 左上角效能資訊
+        cv2.putText(frame, f"FPS: {fps:.1f} | STATE: {state}", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # B. 繪製框體與標籤
+        # 優先找與當前 stable_state 一致的框來畫
+        target_cls = 0 if state == "OPEN" else 1
+        relevant_dets = [d for d in valid_detections if d['cls'] == target_cls]
+        
+        if relevant_dets:
+            # 取信心度最高的一個
+            d = sorted(relevant_dets, key=lambda x: x['conf'], reverse=True)[0]
+            x1, y1, x2, y2 = map(int, d['xyxy'])
+            color = engine.colors[state]
+            thickness = 4 if state == "OPEN" else 2
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+            
+            label = f"DOOR {state}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 15), (x1 + tw + 10, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 5, y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        t0 = perf_counter()
-        result = model.predict(frame, conf=conf, iou=iou, verbose=False)[0]
-        vis = result.plot()
-        infer_fps = 1.0 / max(perf_counter() - t0, 1e-6)
-
-        det_count = 0 if result.boxes is None else len(result.boxes)
-        frame_count += 1
-
-        cv2.putText(
-            vis,
-            f"Infer FPS: {infer_fps:.1f}",
-            (12, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2,
-        )
-        cv2.putText(
-            vis,
-            f"Frame: {frame_count}",
-            (12, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 0),
-            2,
-        )
-        cv2.putText(
-            vis,
-            f"Detections: {det_count}",
-            (12, 90),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (120, 255, 120),
-            2,
-        )
-
-        writer.write(vis)
-
-        if show_window:
-            cv2.imshow(window_name, vis)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-        elif frame_count % 30 == 0:
-            print(f"processed {frame_count} frames")
+        out.write(frame)
 
     cap.release()
-    writer.release()
-    if show_window:
-        cv2.destroyAllWindows()
-
-    print(f"video inference complete, frames processed: {frame_count}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a trained YOLO .pt model on a video and save labeled output")
-    parser.add_argument("--model", type=str, default=str(DEFAULT_MODEL), help="trained YOLO .pt path")
-    parser.add_argument("--source", type=str, default="", help="video path or camera index")
-    parser.add_argument("--conf", type=float, default=0.25, help="confidence threshold")
-    parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold")
-    parser.add_argument(
-        "--display",
-        type=str,
-        default="auto",
-        choices=["auto", "always", "never"],
-        help="show OpenCV window or not",
-    )
-    parser.add_argument("--output", type=str, default="", help="optional labeled video output path")
-    args = parser.parse_args()
-
-    model_path = Path(args.model)
-    if not model_path.exists():
-        raise FileNotFoundError(f"model not found: {model_path}")
-
-    source_arg = args.source.strip()
-    if not source_arg:
-        default_video = find_default_video_source()
-        if default_video is None:
-            raise SystemExit(
-                "No --source provided and no video found in data/1_raw/videos. "
-                "Please pass --source <video_path>."
-            )
-        print(f"no --source provided, using first video found: {default_video}")
-        source_arg = default_video
-
-    source = parse_source(source_arg)
-    show_window = resolve_display_mode(args.display)
-    output_path = Path(args.output) if args.output else default_output_path(source, ".mp4")
-
-    model = YOLO(str(model_path))
-    run_video_inference(
-        model=model,
-        source=source,
-        conf=args.conf,
-        iou=args.iou,
-        show_window=show_window,
-        output_path=output_path,
-    )
-
-    print_pipeline_notice(
-        output_paths=output_path,
-        next_script="src/analyze_errors.py",
-        notes=[
-            "輸出影片已包含模型預測框與類別標籤。",
-            "若你要測不同權重，可改 --model 指向 latest_best.pt 或其他實驗權重。",
-        ],
-    )
-
+    out.release()
+    logger.info(f"Done! Industrial report saved to: {output_path}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default=str(settings.paths.experiments / "incremental/exp_incremental_auto_iter_all_0423_1405/weights/best.pt"))
+    parser.add_argument("--source", type=str, default=str(settings.paths.storage / "assets/videos"))
+    args = parser.parse_args()
+    
+    m_path = Path(args.model)
+    s_path = Path(args.source)
+    out_dir = settings.paths.storage / "artifacts/evaluations/videos"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
+    target_videos = [f for f in s_path.iterdir() if f.suffix in VIDEO_EXTS] if s_path.is_dir() else [s_path]
+    
+    for v_path in target_videos:
+        o_path = out_dir / f"{v_path.stem}_industrial_eval.mp4"
+        process_video_industrial(m_path, v_path, o_path)

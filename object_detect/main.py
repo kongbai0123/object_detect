@@ -1,4 +1,4 @@
-import cv2
+﻿import cv2
 from time import perf_counter
 
 def main():

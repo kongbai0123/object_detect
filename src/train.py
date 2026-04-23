@@ -19,8 +19,9 @@ from anti_gravity.settings import settings
 # 1 Logging System
 # =====================================================================
 def setup_logger(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_dir = settings.paths.storage_logs
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "training_master.log"
     
     logger = logging.getLogger("YOLOv8Trainer")
     logger.setLevel(logging.INFO)
@@ -243,7 +244,7 @@ class ExperimentTracker:
 
     def update_markdown_report(self, record, status="已存檔"):
         """自動維護 data/7_experiments/training_history.md (表格式)"""
-        md_file = settings.paths.experiments / "training_history.md"
+        md_file = settings.paths.storage_logs / "training_history.md"
         os.makedirs(os.path.dirname(md_file), exist_ok=True)
         
         if not os.path.exists(md_file):
